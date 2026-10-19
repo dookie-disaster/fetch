@@ -60,7 +60,7 @@ type FileWriter struct {
 	canceled    bool
 	syncOnClose bool
 	// seeked tracks whether Seek was called explicitly. ensureOpen only
-	// clamps pos to the on-disk size when pos still came from the initial
+	// reconciles pos to the on-disk size when pos still came from the initial
 	// NewFileWriter stat; an explicit Seek past EOF must be honored so the
 	// next write creates a sparse hole instead of being silently rewound.
 	seeked bool
@@ -337,13 +337,11 @@ func (fw *FileWriter) ensureOpen() error {
 	// Reconcile with on-disk state to avoid sparse holes or stale positions
 	// when the file changed between NewFileWriter and the first write. An
 	// explicit Seek past EOF is honored (sparse hole); only the implicit
-	// position from the initial stat is clamped.
+	// position from the initial stat is reconciled to the on-disk size
+	// (both shrink and growth).
 	if !fw.seeked {
 		if st, err := f.Stat(); err == nil {
-			size := st.Size()
-			if fw.pos > size {
-				fw.pos = size
-			}
+			fw.pos = st.Size()
 		}
 	}
 	if fw.pos > 0 {

@@ -306,6 +306,61 @@ func TestFileWriterReconcilesExternalShrinkBeforeFirstWrite(t *testing.T) {
 	})
 }
 
+func TestFileWriterReconcilesExternalGrowBeforeFirstWrite(t *testing.T) {
+	t.Run("externally grown", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+		require.Equal(t, int64(5), fw.Pos())
+
+		// External growth between NewFileWriter and the first write.
+		require.NoError(t, os.WriteFile(path, []byte("hello world!"), 0o644))
+
+		_, err := fw.Write([]byte("XY"))
+		require.NoError(t, err)
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "hello world!XY", string(data))
+		assert.Equal(t, int64(14), fw.Pos())
+		st, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(14), st.Size())
+	})
+
+	t.Run("grown after position query", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+		require.Equal(t, int64(5), fw.Pos())
+
+		// Read-only position query must not mark the writer as seeked.
+		pos, err := fw.Seek(0, io.SeekCurrent)
+		require.NoError(t, err)
+		require.Equal(t, int64(5), pos)
+
+		// External growth between NewFileWriter and the first write.
+		require.NoError(t, os.WriteFile(path, []byte("hello world!"), 0o644))
+
+		_, err = fw.Write([]byte("XY"))
+		require.NoError(t, err)
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "hello world!XY", string(data))
+		assert.Equal(t, int64(14), fw.Pos())
+		st, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(14), st.Size())
+	})
+}
+
 func TestFileWriterResetAfterSeekStartOnUnopenedTruncates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "out.bin")
