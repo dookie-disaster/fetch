@@ -1,4 +1,4 @@
-opencode*
+.opencode
 # Go build artifacts
 *.exe
 *.exe~
