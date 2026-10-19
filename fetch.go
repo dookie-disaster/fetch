@@ -252,9 +252,9 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		}
 		// A retry after partial bytes were committed to a non-rewindable
 		// stream would duplicate data: fail fast instead of corrupting.
-		// The caller's explicit Range takes over writer positioning, so it
-		// is exempt from this guard.
-		if attemptWrote > 0 && !userRange && !canRestoreWriter(writerForIO) {
+		// This applies to a caller-supplied Range too, since that header
+		// is static across attempts and a retry would re-send the same bytes.
+		if attemptWrote > 0 && !canRestoreWriter(writerForIO) {
 			return s.wrapFinal(method, target, attempt,
 				fmt.Errorf("fetch: cannot retry after %d bytes were written to non-rewindable writer: %w", attemptWrote, aerr))
 		}
@@ -266,10 +266,13 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		}
 		// Rewind to the initial state when the next attempt will not
 		// resume from the current position. A resumed seeker continues via
-		// Range; everything else must start clean.
-		if attemptWrote > 0 && !userRange {
+		// Range; everything else must start clean. A caller-supplied Range
+		// is static, so its retry re-sends the same bytes and must start
+		// from a clean writer (restored to the pre-Fetch state) instead of
+		// appending a second copy.
+		if attemptWrote > 0 {
 			willResume := false
-			if rc.resume {
+			if rc.resume && !userRange {
 				if pos, ok := seekerPos(writerForIO); ok && pos > 0 {
 					willResume = true
 				}

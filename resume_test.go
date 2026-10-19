@@ -283,3 +283,76 @@ func TestResumeShortPartialContentContinuesWithinAttempt(t *testing.T) {
 	assert.Equal(t, int64(len(fullBody)), last.Written)
 	assert.Equal(t, int64(len(fullBody)), last.Total)
 }
+
+func TestUserRangeRetryRestoresWriterBeforeRetry(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-10/11")
+		w.Header().Set("Content-Length", "11")
+		w.WriteHeader(http.StatusPartialContent)
+		if n == 1 {
+			fmt.Fprint(w, "hello wo")
+			return
+		}
+		fmt.Fprint(w, fullBody)
+	})
+	s := testSession(t, WithDefaultRetries(1))
+
+	var buf bytes.Buffer
+	require.NoError(t, s.Get(context.Background(), ts.URL, &buf, WithHeader("Range", "bytes=0-")))
+
+	assert.Equal(t, fullBody, buf.String())
+	assert.Equal(t, "bytes=0-", ts.record(1).Header.Get("Range"))
+	assert.Equal(t, "bytes=0-", ts.record(2).Header.Get("Range"))
+	assert.Equal(t, 2, ts.count())
+}
+
+func TestUserRangeRetryNonRewindableFailsFast(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-10/11")
+		w.Header().Set("Content-Length", "11")
+		w.WriteHeader(http.StatusPartialContent)
+		if n == 1 {
+			fmt.Fprint(w, "hello wo")
+			return
+		}
+		fmt.Fprint(w, fullBody)
+	})
+	s := testSession(t)
+
+	w := &nonRewindableWriter{}
+	err := s.Get(context.Background(), ts.URL, w,
+		WithHeader("Range", "bytes=0-"),
+		WithRetries(1),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-rewindable")
+	assert.Equal(t, 1, ts.count())
+	assert.Equal(t, "hello wo", string(w.buf))
+}
+
+func TestUserRangeRetryFileWriterRestoresBeforeRetry(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 2-10/11")
+		w.Header().Set("Content-Length", "9")
+		w.WriteHeader(http.StatusPartialContent)
+		if n == 1 {
+			fmt.Fprint(w, "llo wo")
+			return
+		}
+		fmt.Fprint(w, "llo world")
+	})
+	s := testSession(t, WithDefaultRetries(1))
+
+	path := filepath.Join(t.TempDir(), "out.bin")
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+	fw := NewFileWriter(path)
+	defer fw.Close()
+
+	require.NoError(t, s.Get(context.Background(), ts.URL, fw, WithHeader("Range", "bytes=2-")))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "hello"+"llo world", string(data))
+	assert.Equal(t, 2, ts.count())
+}
