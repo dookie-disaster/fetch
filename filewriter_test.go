@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -218,4 +219,182 @@ func TestFileWriterPath(t *testing.T) {
 func TestFileWriterIsWriteSeeker(t *testing.T) {
 	var _ io.WriteSeeker = (*FileWriter)(nil)
 	var _ io.Closer = (*FileWriter)(nil)
+}
+
+func TestFileWriterNilOption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.bin")
+	require.NotPanics(t, func() {
+		fw := NewFileWriter(path, nil)
+		defer fw.Close()
+		_, err := fw.Write([]byte("x"))
+		require.NoError(t, err)
+	})
+}
+
+func TestFileWriterReconcilesExternalShrinkBeforeFirstWrite(t *testing.T) {
+	t.Run("removed", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+		require.Equal(t, int64(5), fw.Pos())
+
+		// External removal between NewFileWriter and the first write.
+		require.NoError(t, os.Remove(path))
+
+		// Read-only position query must not mark the writer as seeked.
+		pos, err := fw.Seek(0, io.SeekCurrent)
+		require.NoError(t, err)
+		require.Equal(t, int64(5), pos)
+
+		_, err = fw.Write([]byte("hi"))
+		require.NoError(t, err)
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "hi", string(data), "ensureOpen must reconcile pos with on-disk size instead of creating a sparse hole")
+		assert.Equal(t, int64(2), fw.Pos())
+		st, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), st.Size())
+	})
+
+	t.Run("externally truncated", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+		require.Equal(t, int64(5), fw.Pos())
+
+		// External truncation between NewFileWriter and the first write.
+		require.NoError(t, os.Truncate(path, 2))
+
+		pos, err := fw.Seek(0, io.SeekCurrent)
+		require.NoError(t, err)
+		require.Equal(t, int64(5), pos)
+
+		_, err = fw.Write([]byte("XY"))
+		require.NoError(t, err)
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "heXY", string(data), "ensureOpen must reconcile pos with on-disk size instead of creating a sparse hole")
+		assert.Equal(t, int64(4), fw.Pos())
+		st, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4), st.Size())
+	})
+
+	t.Run("SeekEnd on missing file reconciles to zero", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+		require.Equal(t, int64(5), fw.Pos())
+
+		require.NoError(t, os.Remove(path))
+
+		pos, err := fw.Seek(0, io.SeekEnd)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), pos)
+	})
+}
+
+func TestFileWriterResetAfterSeekStartOnUnopenedTruncates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.bin")
+	require.NoError(t, os.WriteFile(path, []byte("partial"), 0o644))
+
+	fw := NewFileWriter(path)
+	defer fw.Close()
+	require.Equal(t, int64(7), fw.Pos())
+
+	_, err := fw.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	require.NoError(t, fw.Reset())
+	assert.Equal(t, int64(0), fw.Pos())
+
+	st, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), st.Size(), "Reset on unopened writer must truncate on-disk file even when pos is already 0")
+}
+
+func TestFileWriterTruncate(t *testing.T) {
+	t.Run("direct", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.bin")
+		fw := NewFileWriter(path)
+		defer fw.Close()
+
+		// *FileWriter must implement interface{ Truncate(int64) error }.
+		var _ interface{ Truncate(int64) error } = (*FileWriter)(nil)
+		_, ok := interface{}(fw).(interface{ Truncate(int64) error })
+		require.True(t, ok, "*FileWriter must implement Truncate(int64) error")
+
+		_, err := fw.Write([]byte("0123456789"))
+		require.NoError(t, err)
+
+		require.NoError(t, fw.Truncate(4))
+		assert.Equal(t, int64(4), fw.Pos())
+
+		st, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4), st.Size())
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "0123", string(data))
+
+		pos, err := fw.Seek(0, io.SeekCurrent)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4), pos)
+
+		_, err = fw.Write([]byte("AB"))
+		require.NoError(t, err)
+		data, err = os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "0123AB", string(data))
+	})
+
+	t.Run("via ProgressWriter", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.bin")
+		fw := NewFileWriter(path)
+		defer fw.Close()
+
+		_, err := fw.Write([]byte("0123456789"))
+		require.NoError(t, err)
+
+		pw := NewProgressWriter(fw, time.Millisecond, nil)
+		require.NoError(t, pw.Truncate(3))
+
+		assert.Equal(t, int64(3), fw.Pos())
+		st, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), st.Size())
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "012", string(data))
+	})
+
+	t.Run("unopened", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
+		fw := NewFileWriter(path)
+		defer fw.Close()
+		require.Equal(t, int64(10), fw.Pos())
+
+		require.NoError(t, fw.Truncate(4))
+		assert.Equal(t, int64(4), fw.Pos())
+		st, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4), st.Size())
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "0123", string(data))
+	})
 }

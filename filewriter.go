@@ -76,7 +76,9 @@ var _ io.WriteSeeker = (*FileWriter)(nil)
 func NewFileWriter(path string, opts ...FileOption) *FileWriter {
 	fw := &FileWriter{path: path, perm: 0o644}
 	for _, opt := range opts {
-		opt(fw)
+		if opt != nil {
+			opt(fw)
+		}
 	}
 	if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() {
 		fw.pos = st.Size()
@@ -142,7 +144,11 @@ func (fw *FileWriter) Seek(offset int64, whence int) (int64, error) {
 				size = st.Size()
 			}
 		} else if st, err := os.Stat(fw.path); err == nil {
-			size = st.Size()
+			if st.Mode().IsRegular() {
+				size = st.Size()
+			}
+		} else if errors.Is(err, fs.ErrNotExist) && !fw.seeked {
+			size = 0
 		}
 		np = size + offset
 	default:
@@ -157,7 +163,9 @@ func (fw *FileWriter) Seek(offset int64, whence int) (int64, error) {
 		}
 	}
 	fw.pos = np
-	fw.seeked = true
+	if !(whence == io.SeekCurrent && offset == 0) {
+		fw.seeked = true
+	}
 	return np, nil
 }
 
@@ -224,7 +232,7 @@ func (fw *FileWriter) resetLocked() error {
 				return err
 			}
 		}
-	} else if fw.pos > 0 {
+	} else if fw.path != "" {
 		if err := os.Truncate(fw.path, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -234,11 +242,21 @@ func (fw *FileWriter) resetLocked() error {
 	return nil
 }
 
+// Truncate discards session bytes beyond pos, restoring the file to the
+// size it had before a failed attempt. pos == 0 is equivalent to Reset.
+func (fw *FileWriter) Truncate(pos int64) error {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	return fw.truncateLocked(pos)
+}
+
 // truncateTo discards session bytes beyond pos, restoring the file to the
 // size it had before a failed attempt. pos == 0 is equivalent to Reset.
 func (fw *FileWriter) truncateTo(pos int64) error {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+	return fw.Truncate(pos)
+}
+
+func (fw *FileWriter) truncateLocked(pos int64) error {
 	if fw.closed {
 		return os.ErrClosed
 	}
@@ -254,6 +272,11 @@ func (fw *FileWriter) truncateTo(pos int64) error {
 		}
 		if _, err := fw.f.Seek(pos, io.SeekStart); err != nil {
 			return err
+		}
+		if fw.syncOnClose {
+			if err := fw.f.Sync(); err != nil {
+				return err
+			}
 		}
 	} else {
 		// Unopened: shrink the on-disk file when it grew past pos.
