@@ -86,16 +86,16 @@ func (c *sessionConfig) validate() error {
 	if c.baseURLSet {
 		u, err := url.Parse(c.baseURLRaw)
 		if err != nil {
-			return fmt.Errorf("fetch: invalid base url %q: %w", c.baseURLRaw, err)
+			return fmt.Errorf("fetch: invalid base url: %w", urlCause(err))
 		}
 		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("fetch: invalid base url %q: scheme must be http or https", c.baseURLRaw)
+			return fmt.Errorf("fetch: invalid base url %q: scheme must be http or https", u.Redacted())
 		}
 		if u.Host == "" || u.Hostname() == "" {
-			return fmt.Errorf("fetch: invalid base url %q: missing host", c.baseURLRaw)
+			return fmt.Errorf("fetch: invalid base url %q: missing host", u.Redacted())
 		}
 		if u.User != nil {
-			return fmt.Errorf("fetch: invalid base url %q: userinfo not allowed", c.baseURLRaw)
+			return fmt.Errorf("fetch: invalid base url %q: userinfo not allowed", u.Redacted())
 		}
 		c.baseURL = u
 	}
@@ -285,17 +285,17 @@ func WithDefaultMaxRedirects(n int) SessionOption {
 func validateProxyURL(proxyURL string) error {
 	u, err := url.Parse(proxyURL)
 	if err != nil {
-		return fmt.Errorf("fetch: invalid proxy url %q: %w", proxyURL, err)
+		return fmt.Errorf("fetch: invalid proxy url: %w", urlCause(err))
 	}
 	switch u.Scheme {
 	case "http", "socks5", "socks5h":
 	case "https":
-		return fmt.Errorf("fetch: invalid proxy url %q: https is not supported: the CONNECT request would be sent in plaintext, not over the TLS the scheme promises; use http, socks5 or socks5h", proxyURL)
+		return fmt.Errorf("fetch: invalid proxy url %q: https is not supported: the CONNECT request would be sent in plaintext, not over the TLS the scheme promises; use http, socks5 or socks5h", u.Redacted())
 	default:
-		return fmt.Errorf("fetch: invalid proxy url %q: scheme must be http, socks5 or socks5h", proxyURL)
+		return fmt.Errorf("fetch: invalid proxy url %q: scheme must be http, socks5 or socks5h", u.Redacted())
 	}
 	if u.Host == "" || u.Hostname() == "" {
-		return fmt.Errorf("fetch: invalid proxy url %q: missing host", proxyURL)
+		return fmt.Errorf("fetch: invalid proxy url %q: missing host", u.Redacted())
 	}
 	return nil
 }

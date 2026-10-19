@@ -378,7 +378,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			}
 			next, err := resolveReference(current, loc)
 			if err != nil {
-				return ri, 0, fmt.Errorf("fetch: bad redirect location %q: %w", loc, err)
+				return ri, 0, fmt.Errorf("fetch: bad redirect location %q: %w", redactedURLString(loc), err)
 			}
 			if !sameOrigin(current, next) {
 				crossOrigin = true
@@ -668,22 +668,22 @@ func (s *Session) wrapFinal(method, target string, attempt int, err error) error
 func (s *Session) resolveURL(rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return "", fmt.Errorf("fetch: invalid url %q: %w", rawURL, err)
+		return "", fmt.Errorf("fetch: invalid url: %w", urlCause(err))
 	}
 	if s.cfg.baseURL != nil && !u.IsAbs() {
 		u = s.cfg.baseURL.ResolveReference(u)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		if u.Scheme == "" || u.Host == "" || u.Hostname() == "" {
-			return "", fmt.Errorf("fetch: invalid url %q: missing scheme or host", rawURL)
+			return "", fmt.Errorf("fetch: invalid url %q: missing scheme or host", u.Redacted())
 		}
-		return "", fmt.Errorf("fetch: invalid url %q: scheme must be http or https", rawURL)
+		return "", fmt.Errorf("fetch: invalid url %q: scheme must be http or https", u.Redacted())
 	}
 	if u.Host == "" || u.Hostname() == "" {
-		return "", fmt.Errorf("fetch: invalid url %q: missing host", rawURL)
+		return "", fmt.Errorf("fetch: invalid url %q: missing host", u.Redacted())
 	}
 	if u.User != nil {
-		return "", fmt.Errorf("fetch: invalid url %q: userinfo not allowed", rawURL)
+		return "", fmt.Errorf("fetch: invalid url %q: userinfo not allowed", u.Redacted())
 	}
 	return u.String(), nil
 }
@@ -695,11 +695,11 @@ func (s *Session) resolveURL(rawURL string) (string, error) {
 func resolveReference(base, ref string) (string, error) {
 	r, err := url.Parse(ref)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetch: invalid redirect location: %w", urlCause(err))
 	}
 	b, err := url.Parse(base)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetch: invalid redirect location: %w", urlCause(err))
 	}
 	var resolved *url.URL
 	if r.IsAbs() {
@@ -709,15 +709,15 @@ func resolveReference(base, ref string) (string, error) {
 	}
 	if resolved.Scheme != "http" && resolved.Scheme != "https" {
 		if resolved.Scheme == "" || resolved.Host == "" || resolved.Hostname() == "" {
-			return "", fmt.Errorf("fetch: invalid redirect location %q: missing scheme or host", ref)
+			return "", fmt.Errorf("fetch: invalid redirect location %q: missing scheme or host", resolved.Redacted())
 		}
-		return "", fmt.Errorf("fetch: invalid redirect location %q: scheme must be http or https", ref)
+		return "", fmt.Errorf("fetch: invalid redirect location %q: scheme must be http or https", resolved.Redacted())
 	}
 	if resolved.Host == "" || resolved.Hostname() == "" {
-		return "", fmt.Errorf("fetch: invalid redirect location %q: missing host", ref)
+		return "", fmt.Errorf("fetch: invalid redirect location %q: missing host", resolved.Redacted())
 	}
 	if resolved.User != nil {
-		return "", fmt.Errorf("fetch: invalid redirect location %q: userinfo not allowed", ref)
+		return "", fmt.Errorf("fetch: invalid redirect location %q: userinfo not allowed", resolved.Redacted())
 	}
 	return resolved.String(), nil
 }
