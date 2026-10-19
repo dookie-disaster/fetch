@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -585,4 +587,175 @@ func TestRetryCallerProgressWriterBuffer(t *testing.T) {
 	))
 	assert.Equal(t, fullBody, buf.String(), "stacked ProgressWriters must restore buffer without duplication")
 	assert.Equal(t, 2, ts.count())
+}
+
+func TestPostOsFileReplayOnRetry(t *testing.T) {
+	payload := "os-file-retry-payload"
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	})
+	s := testSession(t)
+
+	path := filepath.Join(t.TempDir(), "body.bin")
+	require.NoError(t, os.WriteFile(path, []byte(payload), 0o644))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	var buf bytes.Buffer
+	require.NoError(t, s.Post(context.Background(), ts.URL, f, &buf))
+	require.Equal(t, 2, ts.count())
+	assert.Equal(t, payload, string(ts.record(1).Body), "first attempt must send the file body")
+	assert.Equal(t, payload, string(ts.record(2).Body), "retry must replay the file body identically")
+
+	// The caller's *os.File must remain open and usable: httpcloak's
+	// transport closes request bodies that implement io.Closer, so without
+	// NopCloser wrapping the first attempt would close f and the retry
+	// would fail with os.ErrClosed.
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err, "caller's *os.File must remain open after Post")
+	got, err := io.ReadAll(f)
+	require.NoError(t, err)
+	assert.Equal(t, payload, string(got))
+}
+
+func TestPostOsFileWithOffsetReplayOnRetry(t *testing.T) {
+	content := "HEADERPAYLOAD"
+	expected := "PAYLOAD"
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	})
+	s := testSession(t)
+
+	path := filepath.Join(t.TempDir(), "body.bin")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	_, err = f.Seek(int64(len("HEADER")), io.SeekStart)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, s.Post(context.Background(), ts.URL, f, &buf))
+	require.Equal(t, 2, ts.count())
+	assert.Equal(t, expected, string(ts.record(1).Body), "first attempt must send from the pre-seeked offset")
+	assert.Equal(t, expected, string(ts.record(2).Body), "retry must replay from the pre-seeked offset, not the full file")
+
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err, "caller's *os.File must remain open after Post")
+	got, err := io.ReadAll(f)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(got), "file content must be intact and readable after Post")
+}
+
+func TestPostOsFileReplayOn307Redirect(t *testing.T) {
+	payload := "os-file-307-payload"
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			w.Header().Set("Location", "/target")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	})
+	s := testSession(t)
+
+	path := filepath.Join(t.TempDir(), "body.bin")
+	require.NoError(t, os.WriteFile(path, []byte(payload), 0o644))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	var buf bytes.Buffer
+	require.NoError(t, s.Post(context.Background(), ts.URL+"/redirect", f, &buf))
+	require.Equal(t, 2, ts.count())
+	assert.Equal(t, payload, string(ts.record(1).Body), "first hop must send the file body")
+	assert.Equal(t, payload, string(ts.record(2).Body), "307 redirect must replay the file body identically")
+
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err, "caller's *os.File must remain open after Post")
+	got, err := io.ReadAll(f)
+	require.NoError(t, err)
+	assert.Equal(t, payload, string(got))
+}
+
+func TestPostOsFileWithOffsetReplayOn307Redirect(t *testing.T) {
+	content := "HEADERPAYLOAD"
+	expected := "PAYLOAD"
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			w.Header().Set("Location", "/target")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	})
+	s := testSession(t)
+
+	path := filepath.Join(t.TempDir(), "body.bin")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	_, err = f.Seek(int64(len("HEADER")), io.SeekStart)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, s.Post(context.Background(), ts.URL+"/redirect", f, &buf))
+	require.Equal(t, 2, ts.count())
+	assert.Equal(t, expected, string(ts.record(1).Body))
+	assert.Equal(t, expected, string(ts.record(2).Body), "307 redirect must replay from the pre-seeked offset")
+
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err, "caller's *os.File must remain open after Post")
+	got, err := io.ReadAll(f)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(got))
+}
+
+type closeCountingReader struct {
+	io.Reader
+	closes *atomic.Int64
+}
+
+func (r *closeCountingReader) Close() error {
+	r.closes.Add(1)
+	return nil
+}
+
+func TestWithBodyProviderClosesOnDoStreamError(t *testing.T) {
+	srv := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	url := srv.URL
+	srv.Close() // connection refused from here on
+
+	s := testSession(t, WithDefaultRetries(2))
+
+	var mu sync.Mutex
+	var providers int
+	var closes atomic.Int64
+	err := s.Post(context.Background(), url, nil, nil,
+		WithBodyProvider(func() (io.Reader, error) {
+			mu.Lock()
+			providers++
+			mu.Unlock()
+			return &closeCountingReader{Reader: strings.NewReader("payload"), closes: &closes}, nil
+		}),
+		WithRetryBackoff(time.Millisecond, 2*time.Millisecond),
+	)
+	require.Error(t, err, "request against a closed server must fail")
+	mu.Lock()
+	gotProviders := providers
+	mu.Unlock()
+	assert.Equal(t, 3, gotProviders, "provider must be called once per attempt")
+	assert.Equal(t, int64(3), closes.Load(), "Close must be called on the provider's reader for every failed DoStream attempt so file descriptors are not leaked")
 }

@@ -343,6 +343,11 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			Timeout: rc.timeout,
 		})
 		if err != nil {
+			if rc.bodyFnCustom {
+				if c, ok := bodyReader.(io.Closer); ok {
+					_ = c.Close()
+				}
+			}
 			return nil, 0, err
 		}
 

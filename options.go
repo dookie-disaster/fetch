@@ -641,6 +641,9 @@ func bodyReplayer(body io.Reader) func() (io.Reader, error) {
 	case nil:
 		return func() (io.Reader, error) { return nil, nil }
 	case *bytes.Buffer:
+		if b == nil {
+			return func() (io.Reader, error) { return nil, nil }
+		}
 		data := append([]byte(nil), b.Bytes()...)
 		return func() (io.Reader, error) { return bytes.NewReader(data), nil }
 	default:
@@ -648,11 +651,27 @@ func bodyReplayer(body io.Reader) func() (io.Reader, error) {
 			start, err := rs.Seek(0, io.SeekCurrent)
 			if err != nil {
 				var used atomic.Bool
+				if _, ok := rs.(io.Closer); ok {
+					return func() (io.Reader, error) {
+						if used.Swap(true) {
+							return nil, ErrBodyNotReplayable
+						}
+						return io.NopCloser(rs), nil
+					}
+				}
 				return func() (io.Reader, error) {
 					if used.Swap(true) {
 						return nil, ErrBodyNotReplayable
 					}
 					return body, nil
+				}
+			}
+			if _, ok := rs.(io.Closer); ok {
+				return func() (io.Reader, error) {
+					if _, err := rs.Seek(start, io.SeekStart); err != nil {
+						return nil, fmt.Errorf("rewind request body for replay: %w", err)
+					}
+					return io.NopCloser(rs), nil
 				}
 			}
 			return func() (io.Reader, error) {
