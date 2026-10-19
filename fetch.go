@@ -301,6 +301,8 @@ var bodyHeadersOnRewrite = []string{
 // progress is enabled, otherwise the caller's writer). It returns the
 // response info (nil on transport-level failure), the bytes written during
 // this attempt, and an error of type *StatusError for non-2xx responses.
+// A resumed 206 covering only part of the resource is continued within the
+// same attempt until the advertised total is reached.
 // attempt is the zero-based Fetch attempt number, used to populate
 // StatusError.Attempts so retry policies see the accurate count.
 func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requestConfig, wr io.Writer, pw *ProgressWriter, attempt int) (*ResponseInfo, int64, error) {
@@ -314,13 +316,22 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 	dropBody := false
 	crossOrigin := false
 	userRange := rc.headers.Get("Range") != ""
-	for hop := 0; ; hop++ {
+	// redirects counts only actual redirect follows so that
+	// range-continuation iterations within an attempt do not consume
+	// the redirect budget.
+	redirects := 0
+	// totalWrote accumulates bytes written across all range-continuation
+	// chunks within this attempt.
+	var totalWrote int64
+	rangeContinuations := 0
+	const maxRangeContinuations = 1000
+	for {
 		var bodyReader io.Reader
 		if !dropBody {
 			var err error
 			bodyReader, err = rc.bodyFn()
 			if err != nil {
-				return nil, 0, err
+				return nil, totalWrote, err
 			}
 		}
 		var getBody func() (io.Reader, error)
@@ -359,7 +370,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 					_ = c.Close()
 				}
 			}
-			return nil, 0, err
+			return nil, totalWrote, err
 		}
 
 		// Redirects are followed here rather than by the client, because the
@@ -370,15 +381,15 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 				rc.onResponse(ri)
 			}
 			drainAndClose(resp)
-			if hop >= rc.maxRedirects {
+			if redirects >= rc.maxRedirects {
 				// Hand back the last 3xx alongside the error the way
 				// net/http does when it gives up on a chain; the default
 				// retry policy declines to retry a redirect loop.
-				return ri, 0, fmt.Errorf("%w (%d hops)", ErrTooManyRedirects, rc.maxRedirects)
+				return ri, totalWrote, fmt.Errorf("%w (%d hops)", ErrTooManyRedirects, rc.maxRedirects)
 			}
 			next, err := resolveReference(current, loc)
 			if err != nil {
-				return ri, 0, fmt.Errorf("fetch: bad redirect location %q: %w", redactedURLString(loc), err)
+				return ri, totalWrote, fmt.Errorf("fetch: bad redirect location %q: %w", redactedURLString(loc), err)
 			}
 			if !sameOrigin(current, next) {
 				crossOrigin = true
@@ -392,6 +403,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 				// Method and body are preserved; bodyFn replays it.
 			}
+			redirects++
 			current = next
 			continue
 		}
@@ -403,7 +415,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			drainAndClose(resp)
-			return ri, 0, &StatusError{
+			return ri, totalWrote, &StatusError{
 				URL:        current,
 				StatusCode: resp.StatusCode,
 				Status:     statusText(resp.StatusCode),
@@ -414,7 +426,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 
 		if method == http.MethodHead {
 			resp.Close()
-			return ri, 0, nil
+			return ri, totalWrote, nil
 		}
 
 		// Resume negotiation: the writer already holds some bytes. A
@@ -423,6 +435,8 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 		var resumePos int64
 		var expectedLen = ri.ContentLength
 		var total = ri.ContentLength
+		var isResumedPartial bool
+		var resumedTotal int64
 		if !userRange && rc.resume && wr != nil {
 			if pos, ok := seekerPos(wr); ok && pos > 0 {
 				resumePos = pos
@@ -431,20 +445,22 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 					start, end, crTotal, ok := parseContentRange(ri.Headers.Get("Content-Range"))
 					if !ok {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: resume mismatch: 206 response missing valid Content-Range for bytes from %d", pos)
+						return ri, totalWrote, fmt.Errorf("fetch: resume mismatch: 206 response missing valid Content-Range for bytes from %d", pos)
 					}
 					if start != pos {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: resume mismatch: requested bytes from %d but server sent Content-Range starting at %d", pos, start)
+						return ri, totalWrote, fmt.Errorf("fetch: resume mismatch: requested bytes from %d but server sent Content-Range starting at %d", pos, start)
 					}
 					rangeLen := end - start + 1
 					if ri.ContentLength >= 0 && ri.ContentLength != rangeLen {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: resume mismatch: Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
+						return ri, totalWrote, fmt.Errorf("fetch: resume mismatch: Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
 					}
 					expectedLen = rangeLen
 					if crTotal >= 0 {
 						total = crTotal
+						isResumedPartial = true
+						resumedTotal = crTotal
 					} else if ri.ContentLength >= 0 {
 						total = pos + ri.ContentLength
 					} else {
@@ -459,7 +475,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 					// resetWriter).
 					if err := resetWriter(wr); err != nil {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: reset writer after ignored range request: %w", err)
+						return ri, totalWrote, fmt.Errorf("fetch: reset writer after ignored range request: %w", err)
 					}
 					resumePos = 0
 					expectedLen = ri.ContentLength
@@ -479,11 +495,11 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			}
 			if !ok || start != 0 || crTotal < 0 || end+1 != crTotal {
 				drainAndClose(resp)
-				return ri, 0, fmt.Errorf("fetch: unexpected 206 response without range request (Content-Range %q)", ri.Headers.Get("Content-Range"))
+				return ri, totalWrote, fmt.Errorf("fetch: unexpected 206 response without range request (Content-Range %q)", ri.Headers.Get("Content-Range"))
 			}
 			if ri.ContentLength >= 0 && ri.ContentLength != rangeLen {
 				drainAndClose(resp)
-				return ri, 0, fmt.Errorf("fetch: 206 Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
+				return ri, totalWrote, fmt.Errorf("fetch: 206 Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
 			}
 			expectedLen = rangeLen
 			total = crTotal
@@ -498,13 +514,14 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			}
 		}
 
-		attemptWrote, cerr := copyBody(resp, expectedLen, wr, pw)
+		chunkWrote, cerr := copyBody(resp, expectedLen, wr, pw)
 		resp.Close()
+		totalWrote += chunkWrote
 		if cerr != nil {
 			// Write-side failures (disk full, ...) are not retryable by the
 			// default policy; read-side failures carry
 			// ErrIncompleteResponse and are.
-			return ri, attemptWrote, cerr
+			return ri, totalWrote, cerr
 		}
 
 		// A server that closes the connection early must not count as
@@ -513,16 +530,25 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 		// no body at all but still carry the Content-Length a GET would
 		// produce, so the check does not apply to them.
 		if method != http.MethodHead && expectedLen >= 0 {
-			if attemptWrote < expectedLen {
-				return ri, attemptWrote, fmt.Errorf("fetch: incomplete response body: got %d of %d bytes: %w", attemptWrote, expectedLen, ErrIncompleteResponse)
+			if chunkWrote < expectedLen {
+				return ri, totalWrote, fmt.Errorf("fetch: incomplete response body: got %d of %d bytes: %w", chunkWrote, expectedLen, ErrIncompleteResponse)
 			}
 			// Overshoot is already truncated in copyBody; reaching here
 			// with more bytes is impossible, but keep the guard explicit.
-			if attemptWrote > expectedLen {
-				return ri, attemptWrote, fmt.Errorf("fetch: response body longer than advertised: got %d of %d bytes: %w", attemptWrote, expectedLen, ErrIncompleteResponse)
+			if chunkWrote > expectedLen {
+				return ri, totalWrote, fmt.Errorf("fetch: response body longer than advertised: got %d of %d bytes: %w", chunkWrote, expectedLen, ErrIncompleteResponse)
 			}
 		}
-		return ri, attemptWrote, nil
+		if isResumedPartial && method != http.MethodHead {
+			if endPos := resumePos + chunkWrote; endPos < resumedTotal {
+				rangeContinuations++
+				if rangeContinuations > maxRangeContinuations {
+					return ri, totalWrote, fmt.Errorf("fetch: too many range continuations without completing %d bytes: %w", resumedTotal, ErrIncompleteResponse)
+				}
+				continue
+			}
+		}
+		return ri, totalWrote, nil
 	}
 }
 
