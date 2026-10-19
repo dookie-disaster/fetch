@@ -483,3 +483,106 @@ func TestRestoreWriterVarious(t *testing.T) {
 	assert.True(t, canRestoreWriter(io.Discard))
 	assert.False(t, canRestoreWriter(struct{ io.Writer }{bytes.NewBuffer(nil)}))
 }
+
+// nonRewindableWriter accepts writes but offers no rewind mechanism: no
+// Seek, Reset, Truncate, nor *bytes.Buffer semantics.
+type nonRewindableWriter struct {
+	buf []byte
+}
+
+func (w *nonRewindableWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+// errSeekerWriter implements io.Seeker statically but fails at runtime,
+// like pipes/FIFOs where Seek(0, io.SeekCurrent) errors.
+type errSeekerWriter struct {
+	buf []byte
+}
+
+func (w *errSeekerWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+func (w *errSeekerWriter) Seek(offset int64, whence int) (int64, error) {
+	return 0, fmt.Errorf("seek not supported")
+}
+
+// resetOnlyWriter can discard contents via Reset but does not implement
+// io.Seeker.
+type resetOnlyWriter struct {
+	buf    []byte
+	resets int
+}
+
+func (w *resetOnlyWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+func (w *resetOnlyWriter) Reset() error {
+	w.resets++
+	w.buf = nil
+	return nil
+}
+
+func TestCanRestoreWriterProgressWrappedNonRewindable(t *testing.T) {
+	nr := &nonRewindableWriter{}
+	assert.False(t, canRestoreWriter(nr))
+	pw := NewProgressWriter(nr, time.Millisecond, nil)
+	assert.False(t, canRestoreWriter(pw), "non-rewindable wrapped in ProgressWriter must not be restorable")
+	// Doubly wrapped stays unrestorable.
+	pw2 := NewProgressWriter(pw, time.Millisecond, nil)
+	assert.False(t, canRestoreWriter(pw2))
+	// A failing seeker is not restorable either, bare or wrapped.
+	fs := &errSeekerWriter{}
+	assert.False(t, canRestoreWriter(fs))
+	assert.False(t, canRestoreWriter(NewProgressWriter(fs, time.Millisecond, nil)))
+	// Sanity: buffers (bare or wrapped) stay restorable.
+	var buf bytes.Buffer
+	assert.True(t, canRestoreWriter(NewProgressWriter(&buf, time.Millisecond, nil)))
+	assert.True(t, canRestoreWriter(NewProgressWriter(
+		NewProgressWriter(&buf, time.Millisecond, nil), time.Millisecond, nil)))
+}
+
+func TestNonRewindableWithProgressFailsFast(t *testing.T) {
+	ts := truncatedServer(t, fullBody)
+	s := testSession(t, WithDefaultRetries(1))
+
+	w := &nonRewindableWriter{}
+	err := s.Get(context.Background(), ts.URL, w,
+		WithProgress(func(ProgressStats) {}),
+		WithProgressInterval(time.Millisecond),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-rewindable")
+	assert.Equal(t, 1, ts.count(), "must fail fast without retrying")
+	assert.Equal(t, fullBody[:len(fullBody)-1], string(w.buf))
+}
+
+func TestRetryReseterWriterReset(t *testing.T) {
+	ts := truncatedServer(t, fullBody)
+	s := testSession(t, WithDefaultRetries(1))
+
+	w := &resetOnlyWriter{}
+	require.NoError(t, s.Get(context.Background(), ts.URL, w))
+	assert.Equal(t, fullBody, string(w.buf), "retry must Reset, not append a second copy")
+	assert.Equal(t, 2, ts.count())
+	assert.Equal(t, 1, w.resets, "Reset must be called once before retry")
+}
+
+func TestRetryCallerProgressWriterBuffer(t *testing.T) {
+	ts := truncatedServer(t, fullBody)
+	s := testSession(t, WithDefaultRetries(1))
+
+	var buf bytes.Buffer
+	callerPW := NewProgressWriter(&buf, time.Millisecond, nil)
+	require.NoError(t, s.Get(context.Background(), ts.URL, callerPW,
+		WithProgress(func(ProgressStats) {}),
+		WithProgressInterval(time.Millisecond),
+	))
+	assert.Equal(t, fullBody, buf.String(), "stacked ProgressWriters must restore buffer without duplication")
+	assert.Equal(t, 2, ts.count())
+}

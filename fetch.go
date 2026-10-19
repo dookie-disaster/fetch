@@ -218,6 +218,8 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		}
 		pw = NewProgressWriter(underlying, rc.progressInterval, rc.progress)
 		writerForIO = pw
+	} else if existingPW, ok := wr.(*ProgressWriter); ok && existingPW != nil {
+		pw = existingPW
 	}
 
 	var attempt int

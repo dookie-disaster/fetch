@@ -75,6 +75,9 @@ func (pw *ProgressWriter) SetTotal(n int64) {
 	pw.mu.Lock()
 	pw.total = n
 	pw.mu.Unlock()
+	if u, ok := pw.w.(*ProgressWriter); ok && u != nil {
+		u.SetTotal(n)
+	}
 }
 
 // SetWritten sets the starting byte count, used to position progress at the
@@ -88,6 +91,9 @@ func (pw *ProgressWriter) SetWritten(n int64) {
 	pw.written = n
 	pw.lastWritten = n
 	pw.mu.Unlock()
+	if u, ok := pw.w.(*ProgressWriter); ok && u != nil {
+		u.SetWritten(n)
+	}
 }
 
 // Written returns the number of bytes written through so far.
@@ -125,6 +131,9 @@ func (pw *ProgressWriter) Flush() {
 	pw.mu.Unlock()
 	if fire {
 		pw.fn(stats)
+	}
+	if u, ok := pw.w.(*ProgressWriter); ok && u != nil {
+		u.Flush()
 	}
 }
 
