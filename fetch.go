@@ -370,12 +370,12 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			GetBody: getBody,
 			Timeout: rc.timeout,
 		})
-		if err != nil {
-			if rc.bodyFnCustom {
-				if c, ok := bodyReader.(io.Closer); ok {
-					_ = c.Close()
-				}
+		if rc.bodyFnCustom {
+			if c, ok := bodyReader.(io.Closer); ok {
+				_ = c.Close()
 			}
+		}
+		if err != nil {
 			return nil, totalWrote, err
 		}
 

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -650,6 +651,20 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 	return rc, nil
 }
 
+// isNilReader reports whether r is nil, including typed-nil pointers like
+// (*bytes.Reader)(nil), which are non-nil interfaces holding a nil pointer.
+func isNilReader(r io.Reader) bool {
+	if r == nil {
+		return true
+	}
+	v := reflect.ValueOf(r)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.UnsafePointer:
+		return v.IsNil()
+	}
+	return false
+}
+
 // bodyReplayer wraps body so that each retry attempt gets a fresh reader over
 // the same content.
 //
@@ -666,6 +681,9 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 // A body must not be shared across concurrent Fetch calls; the replay cursor
 // is per-request state.
 func bodyReplayer(body io.Reader) func() (io.Reader, error) {
+	if isNilReader(body) {
+		return func() (io.Reader, error) { return nil, nil }
+	}
 	switch b := body.(type) {
 	case nil:
 		return func() (io.Reader, error) { return nil, nil }
