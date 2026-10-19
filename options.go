@@ -91,7 +91,7 @@ func (c *sessionConfig) validate() error {
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return fmt.Errorf("fetch: invalid base url %q: scheme must be http or https", c.baseURLRaw)
 		}
-		if u.Host == "" {
+		if u.Host == "" || u.Hostname() == "" {
 			return fmt.Errorf("fetch: invalid base url %q: missing host", c.baseURLRaw)
 		}
 		if u.User != nil {
@@ -196,6 +196,10 @@ func WithDefaultHeaders(h http.Header) SessionOption {
 		}
 		out := make(http.Header, len(h))
 		for k, vs := range h {
+			if !isValidHeaderKey(k) {
+				out[k] = vs
+				continue
+			}
 			for _, v := range vs {
 				out.Add(k, v)
 			}
@@ -290,7 +294,7 @@ func validateProxyURL(proxyURL string) error {
 	default:
 		return fmt.Errorf("fetch: invalid proxy url %q: scheme must be http, socks5 or socks5h", proxyURL)
 	}
-	if u.Host == "" {
+	if u.Host == "" || u.Hostname() == "" {
 		return fmt.Errorf("fetch: invalid proxy url %q: missing host", proxyURL)
 	}
 	return nil
@@ -311,9 +315,14 @@ type requestConfig struct {
 	bodyFn           func() (io.Reader, error)
 	bodyFnCustom     bool
 	onResponse       ResponseFunc
+
+	setupErr error
 }
 
 func (rc *requestConfig) validate() error {
+	if rc.setupErr != nil {
+		return rc.setupErr
+	}
 	if rc.retryMinWait < 0 || rc.retryMaxWait < rc.retryMinWait {
 		return fmt.Errorf("fetch: invalid retry backoff: need 0 <= min <= max, got min=%v max=%v", rc.retryMinWait, rc.retryMaxWait)
 	}
@@ -412,6 +421,10 @@ func WithHeaders(h http.Header) RequestOption {
 			rc.headers = http.Header{}
 		}
 		for k, vs := range h {
+			if !isValidHeaderKey(k) {
+				rc.headers[k] = vs
+				continue
+			}
 			rc.headers.Del(k)
 			for _, v := range vs {
 				rc.headers.Add(k, v)
@@ -442,6 +455,17 @@ func WithCookieHeader(raw string) RequestOption {
 // Cookie header is already present, the new cookies are appended with "; ".
 func WithCookies(cookies ...*http.Cookie) RequestOption {
 	return func(rc *requestConfig) {
+		for _, c := range cookies {
+			if c == nil || c.Name == "" {
+				continue
+			}
+			if !isValidHeaderKey(c.Name) || !isValidHeaderValue(c.Value) || strings.ContainsRune(c.Value, ';') {
+				if rc.setupErr == nil {
+					rc.setupErr = fmt.Errorf("fetch: invalid cookie %q: name must be a valid RFC 7230 token and value must not contain CTLs or ';'", c.Name)
+				}
+				return
+			}
+		}
 		raw := serializeCookies(cookies)
 		if raw == "" {
 			return
@@ -604,7 +628,9 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 		maxRedirects:     s.cfg.maxRedirects,
 	}
 	for _, opt := range opts {
-		opt(rc)
+		if opt != nil {
+			opt(rc)
+		}
 	}
 	if rc.retryPolicy == nil {
 		rc.retryPolicy = DefaultRetryPolicy

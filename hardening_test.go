@@ -237,3 +237,99 @@ func TestProgressCumulativeAcrossRetry(t *testing.T) {
 	var buf bytes.Buffer
 	_ = buf
 }
+
+func TestParseContentRangeRejectsMaxInt64End(t *testing.T) {
+	_, _, _, ok := parseContentRange("bytes 0-9223372036854775807/*")
+	assert.False(t, ok, "e == MaxInt64 must be rejected to avoid int64 overflow")
+}
+
+func TestGetRejectsMaxInt64ContentRange(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-9223372036854775807/*")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("x"))
+	})
+	s := testSession(t, WithDefaultRetries(0))
+	var out bytes.Buffer
+	err := s.Get(context.Background(), ts.URL, &out)
+	require.Error(t, err, "206 with MaxInt64 end must fail instead of overflowing expectedLen to negative")
+}
+
+func TestHostlessURLsWithPortsRejected(t *testing.T) {
+	s := testSession(t)
+	err := s.Get(context.Background(), "http://:80/x", nil)
+	require.Error(t, err)
+	assert.Contains(t, strings.ToLower(err.Error()), "host")
+
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://:80/x")
+		w.WriteHeader(http.StatusFound)
+	})
+	err = s.Get(context.Background(), ts.URL, nil)
+	require.Error(t, err)
+
+	_, err = NewSession(WithBaseURL("http://:80/"))
+	require.Error(t, err)
+
+	_, err = NewSession(WithProxy("http://:8080"))
+	require.Error(t, err)
+}
+
+func TestInvalidHeaderKeyEmptySliceRejected(t *testing.T) {
+	_, err := NewSession(WithDefaultHeaders(http.Header{"Bad\r\nKey": {}}))
+	require.Error(t, err)
+
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	s := testSession(t)
+	err = s.Get(context.Background(), ts.URL, nil, WithHeaders(http.Header{"Bad\r\nKey": {}}))
+	require.Error(t, err)
+}
+
+func TestNilOptionsDoNotPanic(t *testing.T) {
+	var nilSessionOpt SessionOption
+	require.NotPanics(t, func() {
+		s, err := NewSession(nilSessionOpt)
+		require.NoError(t, err)
+		s.Close()
+	})
+	require.NotPanics(t, func() {
+		_, _ = NewSession(nil)
+	})
+
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	s := testSession(t)
+	var nilReqOpt RequestOption
+	require.NotPanics(t, func() {
+		require.NoError(t, s.Get(context.Background(), ts.URL, nil, nilReqOpt))
+	})
+	require.NotPanics(t, func() {
+		require.NoError(t, s.Get(context.Background(), ts.URL, nil, nil))
+	})
+}
+
+func TestWithCookiesRejectsInjection(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	s := testSession(t)
+	cases := []*http.Cookie{
+		{Name: "a", Value: "b;c"},
+		{Name: "a=b", Value: "c"},
+		{Name: "a;b", Value: "c"},
+		{Name: "a b", Value: "c"},
+		{Name: "a", Value: "b\x01c"},
+		{Name: "bad\r\n", Value: "c"},
+	}
+	for _, c := range cases {
+		err := s.Get(context.Background(), ts.URL, nil, WithCookies(c))
+		require.Error(t, err, "cookie %+v should be rejected", c)
+	}
+	assert.Equal(t, 0, ts.count(), "invalid cookies must fail before sending")
+}
+
+func TestRetryAfterExceedingInt64Saturates(t *testing.T) {
+	ri := &ResponseInfo{Headers: http.Header{"Retry-After": {"99999999999999999999"}}}
+	d, ok := retryAfterDelay(ri)
+	require.True(t, ok, "delta-seconds exceeding MaxInt64 must saturate, not return ok=false")
+	assert.Greater(t, d, time.Duration(0), "saturated duration must be positive")
+	rc := &requestConfig{retryMinWait: time.Millisecond, retryMaxWait: 40 * time.Millisecond}
+	assert.Equal(t, 40*time.Millisecond, retryWait(rc, ri, 1))
+}

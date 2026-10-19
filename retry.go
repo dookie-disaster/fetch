@@ -3,6 +3,7 @@ package fetch
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -77,6 +78,9 @@ func backoffDelay(minWait, maxWait time.Duration, retry int) time.Duration {
 	if span <= 0 {
 		return limit
 	}
+	if int64(span) == math.MaxInt64 {
+		return minWait + time.Duration(rand.Int64N(int64(span)))
+	}
 	return minWait + time.Duration(rand.Int64N(int64(span)+1))
 }
 
@@ -116,12 +120,14 @@ func retryAfterDelay(ri *ResponseInfo) (d time.Duration, ok bool) {
 	if v == "" {
 		return 0, false
 	}
-	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
 		const maxSeconds = int64(1<<63-1) / int64(time.Second)
-		if int64(n) > maxSeconds {
+		if n > maxSeconds {
 			return time.Duration(1<<63 - 1), true
 		}
 		return time.Duration(n) * time.Second, true
+	} else if err != nil && errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(v, "-") {
+		return time.Duration(1<<63 - 1), true
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		d = time.Until(t)

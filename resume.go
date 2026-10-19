@@ -3,6 +3,7 @@ package fetch
 import (
 	"bytes"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -256,7 +257,7 @@ func parseContentRange(v string) (start, end, total int64, ok bool) {
 		return 0, 0, total, false
 	}
 	e, err := strconv.ParseInt(strings.TrimSpace(rangePart[dash+1:]), 10, 64)
-	if err != nil || e < 0 || e < s {
+	if err != nil || e < 0 || e < s || e == math.MaxInt64 {
 		return 0, 0, total, false
 	}
 	if total >= 0 && e >= total {

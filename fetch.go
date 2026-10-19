@@ -90,7 +90,9 @@ type Session struct {
 func NewSession(opts ...SessionOption) (*Session, error) {
 	cfg := defaultSessionConfig()
 	for _, opt := range opts {
-		opt(&cfg)
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -672,12 +674,12 @@ func (s *Session) resolveURL(rawURL string) (string, error) {
 		u = s.cfg.baseURL.ResolveReference(u)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		if u.Scheme == "" || u.Host == "" {
+		if u.Scheme == "" || u.Host == "" || u.Hostname() == "" {
 			return "", fmt.Errorf("fetch: invalid url %q: missing scheme or host", rawURL)
 		}
 		return "", fmt.Errorf("fetch: invalid url %q: scheme must be http or https", rawURL)
 	}
-	if u.Host == "" {
+	if u.Host == "" || u.Hostname() == "" {
 		return "", fmt.Errorf("fetch: invalid url %q: missing host", rawURL)
 	}
 	if u.User != nil {
@@ -706,12 +708,12 @@ func resolveReference(base, ref string) (string, error) {
 		resolved = b.ResolveReference(r)
 	}
 	if resolved.Scheme != "http" && resolved.Scheme != "https" {
-		if resolved.Scheme == "" || resolved.Host == "" {
+		if resolved.Scheme == "" || resolved.Host == "" || resolved.Hostname() == "" {
 			return "", fmt.Errorf("fetch: invalid redirect location %q: missing scheme or host", ref)
 		}
 		return "", fmt.Errorf("fetch: invalid redirect location %q: scheme must be http or https", ref)
 	}
-	if resolved.Host == "" {
+	if resolved.Host == "" || resolved.Hostname() == "" {
 		return "", fmt.Errorf("fetch: invalid redirect location %q: missing host", ref)
 	}
 	if resolved.User != nil {
