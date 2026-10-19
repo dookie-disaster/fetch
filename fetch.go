@@ -701,15 +701,15 @@ func (s *Session) resolveURL(rawURL string) (string, error) {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		if u.Scheme == "" || u.Host == "" || u.Hostname() == "" {
-			return "", fmt.Errorf("fetch: invalid url %q: missing scheme or host", u.Redacted())
+			return "", fmt.Errorf("fetch: invalid url %q: missing scheme or host", redactedURLString(rawURL))
 		}
-		return "", fmt.Errorf("fetch: invalid url %q: scheme must be http or https", u.Redacted())
+		return "", fmt.Errorf("fetch: invalid url %q: scheme must be http or https", redactedURLString(rawURL))
 	}
 	if u.Host == "" || u.Hostname() == "" {
-		return "", fmt.Errorf("fetch: invalid url %q: missing host", u.Redacted())
+		return "", fmt.Errorf("fetch: invalid url %q: missing host", redactedURLString(rawURL))
 	}
 	if u.User != nil {
-		return "", fmt.Errorf("fetch: invalid url %q: userinfo not allowed", u.Redacted())
+		return "", fmt.Errorf("fetch: invalid url %q: userinfo not allowed", redactedURLString(rawURL))
 	}
 	return u.String(), nil
 }
@@ -735,15 +735,15 @@ func resolveReference(base, ref string) (string, error) {
 	}
 	if resolved.Scheme != "http" && resolved.Scheme != "https" {
 		if resolved.Scheme == "" || resolved.Host == "" || resolved.Hostname() == "" {
-			return "", fmt.Errorf("fetch: invalid redirect location %q: missing scheme or host", resolved.Redacted())
+			return "", fmt.Errorf("fetch: invalid redirect location %q: missing scheme or host", redactedURLString(ref))
 		}
-		return "", fmt.Errorf("fetch: invalid redirect location %q: scheme must be http or https", resolved.Redacted())
+		return "", fmt.Errorf("fetch: invalid redirect location %q: scheme must be http or https", redactedURLString(ref))
 	}
 	if resolved.Host == "" || resolved.Hostname() == "" {
-		return "", fmt.Errorf("fetch: invalid redirect location %q: missing host", resolved.Redacted())
+		return "", fmt.Errorf("fetch: invalid redirect location %q: missing host", redactedURLString(ref))
 	}
 	if resolved.User != nil {
-		return "", fmt.Errorf("fetch: invalid redirect location %q: userinfo not allowed", resolved.Redacted())
+		return "", fmt.Errorf("fetch: invalid redirect location %q: userinfo not allowed", redactedURLString(ref))
 	}
 	return resolved.String(), nil
 }

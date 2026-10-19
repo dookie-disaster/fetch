@@ -89,13 +89,13 @@ func (c *sessionConfig) validate() error {
 			return fmt.Errorf("fetch: invalid base url: %w", urlCause(err))
 		}
 		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("fetch: invalid base url %q: scheme must be http or https", u.Redacted())
+			return fmt.Errorf("fetch: invalid base url %q: scheme must be http or https", redactedURLString(c.baseURLRaw))
 		}
 		if u.Host == "" || u.Hostname() == "" {
-			return fmt.Errorf("fetch: invalid base url %q: missing host", u.Redacted())
+			return fmt.Errorf("fetch: invalid base url %q: missing host", redactedURLString(c.baseURLRaw))
 		}
 		if u.User != nil {
-			return fmt.Errorf("fetch: invalid base url %q: userinfo not allowed", u.Redacted())
+			return fmt.Errorf("fetch: invalid base url %q: userinfo not allowed", redactedURLString(c.baseURLRaw))
 		}
 		c.baseURL = u
 	}
@@ -290,12 +290,12 @@ func validateProxyURL(proxyURL string) error {
 	switch u.Scheme {
 	case "http", "socks5", "socks5h":
 	case "https":
-		return fmt.Errorf("fetch: invalid proxy url %q: https is not supported: the CONNECT request would be sent in plaintext, not over the TLS the scheme promises; use http, socks5 or socks5h", u.Redacted())
+		return fmt.Errorf("fetch: invalid proxy url %q: https is not supported: the CONNECT request would be sent in plaintext, not over the TLS the scheme promises; use http, socks5 or socks5h", redactedURLString(proxyURL))
 	default:
-		return fmt.Errorf("fetch: invalid proxy url %q: scheme must be http, socks5 or socks5h", u.Redacted())
+		return fmt.Errorf("fetch: invalid proxy url %q: scheme must be http, socks5 or socks5h", redactedURLString(proxyURL))
 	}
 	if u.Host == "" || u.Hostname() == "" {
-		return fmt.Errorf("fetch: invalid proxy url %q: missing host", u.Redacted())
+		return fmt.Errorf("fetch: invalid proxy url %q: missing host", redactedURLString(proxyURL))
 	}
 	return nil
 }

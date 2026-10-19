@@ -13,7 +13,7 @@ import (
 // userinfo password without echoing the raw input verbatim when it carries
 // credentials.
 func redactedURLString(raw string) string {
-	if u, err := url.Parse(raw); err == nil && u != nil {
+	if u, err := url.Parse(raw); err == nil && u != nil && u.Opaque == "" {
 		return u.Redacted()
 	}
 	return scrubURLString(raw)
