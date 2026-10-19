@@ -37,6 +37,20 @@ func unwrapWriter(w io.Writer) io.Writer {
 	}
 }
 
+// prepareWriter lets a lazily-positioned writer reconcile with external state
+// before Fetch snapshots the resume offset. Only *FileWriter implements it;
+// other writers are unaffected.
+func prepareWriter(w io.Writer) error {
+	w = unwrapWriter(w)
+	if w == nil {
+		return nil
+	}
+	if p, ok := w.(interface{ prepare() error }); ok {
+		return p.prepare()
+	}
+	return nil
+}
+
 // bufferLen reports the length of w when w is (or wraps) a *bytes.Buffer.
 func bufferLen(w io.Writer) (int, bool) {
 	w = unwrapWriter(w)

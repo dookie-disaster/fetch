@@ -64,6 +64,54 @@ func TestAutoResumeFromPartialFile(t *testing.T) {
 	assert.Equal(t, 1, ts.count())
 }
 
+func TestResumeReconcilesExternalSizeChangesBeforeRequest(t *testing.T) {
+	t.Run("growth", func(t *testing.T) {
+		ts := rangeServer(t, nil)
+		s := testSession(t)
+
+		path := filepath.Join(t.TempDir(), "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644)) // 5 bytes
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+
+		// The file grows after the FileWriter snapshotted its size. Both the
+		// Range header and the first write must use the new size, or the
+		// response is appended at the wrong offset.
+		require.NoError(t, os.WriteFile(path, []byte("hello wor"), 0o644)) // 9 bytes
+
+		require.NoError(t, s.Get(context.Background(), ts.URL, fw, WithResume(true)))
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, fullBody, string(data))
+		assert.Equal(t, "bytes=9-", ts.record(1).Header.Get("Range"))
+		assert.Equal(t, 1, ts.count())
+	})
+
+	t.Run("shrink", func(t *testing.T) {
+		ts := rangeServer(t, nil)
+		s := testSession(t)
+
+		path := filepath.Join(t.TempDir(), "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte(fullBody), 0o644))
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+
+		// The file shrinks after the FileWriter snapshotted its size.
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+		require.NoError(t, s.Get(context.Background(), ts.URL, fw, WithResume(true)))
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, fullBody, string(data))
+		assert.Equal(t, "bytes=5-", ts.record(1).Header.Get("Range"))
+		assert.Equal(t, 1, ts.count())
+	})
+}
+
 func TestResumeDisabledByDefault(t *testing.T) {
 	ts := rangeServer(t, nil)
 	s := testSession(t)

@@ -89,6 +89,61 @@ func TestOpaqueProxyPasswordNotLeaked(t *testing.T) {
 	assert.Contains(t, msg, "proxy")
 }
 
+func TestScrubURLStringRedactsMalformedPasswords(t *testing.T) {
+	cases := []string{
+		"http:user:supersecret@example.com",
+		"http:foo/user:supersecret@example.com",
+		"http:/user:supersecret@example.com",
+		"http:///user:supersecret@example.com",
+		"https://user:supersecret@example.com/a:b@c",
+		"http://user:supersecret@example.com/%zz",
+	}
+	for _, raw := range cases {
+		got := redactedURLString(raw)
+		assert.NotContains(t, got, "supersecret", raw)
+		assert.Contains(t, got, "xxxxx", raw)
+	}
+}
+
+func TestMalformedURLPasswordVariantsNotLeaked(t *testing.T) {
+	forms := []struct {
+		name string
+		raw  string
+	}{
+		{"opaque after slash", "http:foo/user:supersecret@example.com"},
+		{"single slash", "http:/user:supersecret@example.com"},
+		{"triple slash", "http:///user:supersecret@example.com"},
+	}
+	s := testSession(t)
+	for _, tc := range forms {
+		t.Run("request/"+tc.name, func(t *testing.T) {
+			err := s.Get(context.Background(), tc.raw, nil)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "supersecret")
+		})
+		t.Run("base/"+tc.name, func(t *testing.T) {
+			_, err := NewSession(WithBaseURL(tc.raw))
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "supersecret")
+		})
+		t.Run("proxy/"+tc.name, func(t *testing.T) {
+			_, err := NewSession(WithProxy(tc.raw))
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "supersecret")
+		})
+		t.Run("redirect/"+tc.name, func(t *testing.T) {
+			ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", tc.raw)
+				w.WriteHeader(http.StatusFound)
+			})
+			err := s.Get(context.Background(), ts.URL, nil)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "supersecret")
+			assert.Equal(t, 1, ts.count(), "invalid redirect must not be followed")
+		})
+	}
+}
+
 func TestOpaqueRedirectPasswordNotLeaked(t *testing.T) {
 	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "http:user:supersecret@example.com")

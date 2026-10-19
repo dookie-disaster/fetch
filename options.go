@@ -651,19 +651,25 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 	return rc, nil
 }
 
-// isNilReader reports whether r is nil, including typed-nil pointers like
+// isNilInterface reports whether v is nil, including typed-nil pointers like
 // (*bytes.Reader)(nil), which are non-nil interfaces holding a nil pointer.
-func isNilReader(r io.Reader) bool {
-	if r == nil {
+func isNilInterface(v any) bool {
+	if v == nil {
 		return true
 	}
-	v := reflect.ValueOf(r)
-	switch v.Kind() {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
 	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.UnsafePointer:
-		return v.IsNil()
+		return rv.IsNil()
 	}
 	return false
 }
+
+// isNilReader reports whether r is nil or a typed-nil pointer.
+func isNilReader(r io.Reader) bool { return isNilInterface(r) }
+
+// isNilWriter reports whether w is nil or a typed-nil pointer.
+func isNilWriter(w io.Writer) bool { return isNilInterface(w) }
 
 // bodyReplayer wraps body so that each retry attempt gets a fresh reader over
 // the same content.

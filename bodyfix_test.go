@@ -40,6 +40,32 @@ func TestFetchTypedNilBodyDoesNotPanic(t *testing.T) {
 	require.NoError(t, s.Post(context.Background(), ts.URL, sr, nil))
 }
 
+func TestFetchTypedNilWriterDoesNotPanic(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	s := testSession(t)
+
+	var fw *FileWriter
+	require.NotPanics(t, func() {
+		require.NoError(t, s.Get(context.Background(), ts.URL, fw))
+	})
+
+	var pw *ProgressWriter
+	require.NotPanics(t, func() {
+		require.NoError(t, s.Get(context.Background(), ts.URL, pw))
+	})
+}
+
+func TestBodyProviderTypedNilResultTreatedAsNoBody(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	s := testSession(t)
+
+	var br *bytes.Reader
+	err := s.Post(context.Background(), ts.URL, nil, nil,
+		WithBodyProvider(func() (io.Reader, error) { return br, nil }))
+	require.NoError(t, err)
+	assert.Empty(t, ts.record(1).Body)
+}
+
 func TestBodyProviderConflictTypedNilBodyAllowed(t *testing.T) {
 	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
 	s := testSession(t)
@@ -60,7 +86,7 @@ func TestWithBodyProviderClosesOnSuccess(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, closes.Load(), int64(1), "Close must be called on the provider's reader after a successful request")
+	assert.Equal(t, int64(1), closes.Load(), "the transport closes the provider's reader exactly once after a successful request")
 }
 
 func TestWithBodyProviderClosesOnRedirectHop(t *testing.T) {
@@ -83,6 +109,6 @@ func TestWithBodyProviderClosesOnRedirectHop(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), providers.Load(), "provider must be called once per redirect hop")
-	assert.GreaterOrEqual(t, closes.Load(), int64(2), "Close must be called on the provider's reader for every redirect hop")
+	assert.Equal(t, int64(2), closes.Load(), "the transport closes one provider reader per redirect hop")
 	assert.Equal(t, 2, ts.count())
 }

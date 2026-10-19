@@ -318,6 +318,34 @@ func (fw *FileWriter) Cancel() error {
 	return err
 }
 
+// prepare reconciles the implicit position with the on-disk size and pins it
+// before the first write. Fetch calls it before reading the position for a
+// resume range, so the range header and the eventual write start at the same
+// offset even if the file changed after NewFileWriter. An explicit Seek or an
+// already-open file is authoritative and left untouched.
+func (fw *FileWriter) prepare() error {
+	if fw == nil {
+		return nil
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.closed {
+		return os.ErrClosed
+	}
+	if fw.f != nil || fw.seeked {
+		return nil
+	}
+	if st, err := os.Stat(fw.path); err == nil {
+		if st.Mode().IsRegular() {
+			fw.pos = st.Size()
+		}
+	} else if errors.Is(err, fs.ErrNotExist) {
+		fw.pos = 0
+	}
+	fw.seeked = true
+	return nil
+}
+
 // ensureOpen opens the file and positions it at the writer's logical
 // position. It must be called with fw.mu held.
 func (fw *FileWriter) ensureOpen() error {

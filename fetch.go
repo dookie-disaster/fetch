@@ -199,6 +199,9 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		}
 		return fmt.Errorf("fetch: invalid http method %q", method)
 	}
+	if isNilWriter(wr) {
+		wr = nil
+	}
 	rc, err := s.newRequestConfig(opts, body)
 	if err != nil {
 		return err
@@ -206,6 +209,13 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 	target, err := s.resolveURL(rawURL)
 	if err != nil {
 		return err
+	}
+
+	// Reconcile lazily-positioned writers with the on-disk state before
+	// snapshotting the resume offset. Otherwise the Range header could be
+	// based on a stale size while the first write uses the current one.
+	if err := prepareWriter(wr); err != nil {
+		return fmt.Errorf("fetch: prepare writer: %w", err)
 	}
 
 	// Capture the writer's initial state so a retry that cannot resume can
@@ -339,10 +349,19 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			if err != nil {
 				return nil, totalWrote, err
 			}
+			if isNilReader(bodyReader) {
+				bodyReader = nil
+			}
 		}
 		var getBody func() (io.Reader, error)
 		if !dropBody {
-			getBody = rc.bodyFn
+			getBody = func() (io.Reader, error) {
+				r, err := rc.bodyFn()
+				if err != nil || isNilReader(r) {
+					return nil, err
+				}
+				return r, nil
+			}
 		}
 
 		hdr := rc.headerSnapshot()
@@ -370,12 +389,16 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			GetBody: getBody,
 			Timeout: rc.timeout,
 		})
-		if rc.bodyFnCustom {
-			if c, ok := bodyReader.(io.Closer); ok {
-				_ = c.Close()
-			}
-		}
 		if err != nil {
+			// On success the transport owns and closes the request body,
+			// including asynchronously on HTTP/2 and HTTP/3, so closing it
+			// here would double close or race the sender. Keep a close for
+			// error paths, where the transport may never have taken it.
+			if rc.bodyFnCustom {
+				if c, ok := bodyReader.(io.Closer); ok {
+					_ = c.Close()
+				}
+			}
 			return nil, totalWrote, err
 		}
 
