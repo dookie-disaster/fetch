@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,6 +62,54 @@ func TestAutoResumeFromPartialFile(t *testing.T) {
 	// The very first request carried the range header.
 	assert.Equal(t, "bytes=5-", ts.record(1).Header.Get("Range"))
 	assert.Equal(t, 1, ts.count())
+}
+
+func TestResumeReconcilesExternalSizeChangesBeforeRequest(t *testing.T) {
+	t.Run("growth", func(t *testing.T) {
+		ts := rangeServer(t, nil)
+		s := testSession(t)
+
+		path := filepath.Join(t.TempDir(), "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644)) // 5 bytes
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+
+		// The file grows after the FileWriter snapshotted its size. Both the
+		// Range header and the first write must use the new size, or the
+		// response is appended at the wrong offset.
+		require.NoError(t, os.WriteFile(path, []byte("hello wor"), 0o644)) // 9 bytes
+
+		require.NoError(t, s.Get(context.Background(), ts.URL, fw, WithResume(true)))
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, fullBody, string(data))
+		assert.Equal(t, "bytes=9-", ts.record(1).Header.Get("Range"))
+		assert.Equal(t, 1, ts.count())
+	})
+
+	t.Run("shrink", func(t *testing.T) {
+		ts := rangeServer(t, nil)
+		s := testSession(t)
+
+		path := filepath.Join(t.TempDir(), "out.bin")
+		require.NoError(t, os.WriteFile(path, []byte(fullBody), 0o644))
+
+		fw := NewFileWriter(path)
+		defer fw.Close()
+
+		// The file shrinks after the FileWriter snapshotted its size.
+		require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+		require.NoError(t, s.Get(context.Background(), ts.URL, fw, WithResume(true)))
+
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, fullBody, string(data))
+		assert.Equal(t, "bytes=5-", ts.record(1).Header.Get("Range"))
+		assert.Equal(t, 1, ts.count())
+	})
 }
 
 func TestResumeDisabledByDefault(t *testing.T) {
@@ -226,4 +275,132 @@ func TestResumeAcrossSessionInstances(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fullBody, string(data))
 	assert.Equal(t, "bytes=5-", ts.record(2).Header.Get("Range"))
+}
+
+func TestResumeShortPartialContentContinuesWithinAttempt(t *testing.T) {
+	// The server honors Range but serves at most 2 bytes per 206 response
+	// with a correct Content-Range pointing at the full total. The client
+	// must keep issuing range requests within the same attempt until the
+	// writer reaches the advertised total instead of leaving a truncated
+	// file. WithRetries(0) proves the continuation happens inside one
+	// attempt, not via retries.
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		var start int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-", &start); err != nil || start < 0 || start >= int64(len(fullBody)) {
+			w.Header().Set("Content-Length", fmt.Sprint(len(fullBody)))
+			fmt.Fprint(w, fullBody)
+			return
+		}
+		end := start + 1
+		if end >= int64(len(fullBody)) {
+			end = int64(len(fullBody)) - 1
+		}
+		chunk := fullBody[start : end+1]
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(fullBody)))
+		w.Header().Set("Content-Length", fmt.Sprint(len(chunk)))
+		w.WriteHeader(http.StatusPartialContent)
+		fmt.Fprint(w, chunk)
+	})
+	s := testSession(t)
+
+	path := filepath.Join(t.TempDir(), "out.bin")
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644)) // 5 bytes done
+
+	fw := NewFileWriter(path)
+	defer fw.Close()
+
+	var stats []ProgressStats
+	require.NoError(t, s.Get(context.Background(), ts.URL, fw,
+		WithResume(true),
+		WithRetries(0),
+		WithProgress(func(st ProgressStats) { stats = append(stats, st) }),
+		WithProgressInterval(time.Millisecond),
+	))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, fullBody, string(data))
+	assert.Equal(t, int64(len(fullBody)), fw.Pos())
+	assert.Greater(t, ts.count(), 1, "short 206 responses must be continued within one attempt")
+
+	require.NotEmpty(t, stats, "progress must report at least the final snapshot")
+	for i := 1; i < len(stats); i++ {
+		assert.GreaterOrEqual(t, stats[i].Written, stats[i-1].Written, "progress Written must be monotonic")
+	}
+	last := stats[len(stats)-1]
+	assert.Equal(t, int64(len(fullBody)), last.Written)
+	assert.Equal(t, int64(len(fullBody)), last.Total)
+}
+
+func TestUserRangeRetryRestoresWriterBeforeRetry(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-10/11")
+		w.Header().Set("Content-Length", "11")
+		w.WriteHeader(http.StatusPartialContent)
+		if n == 1 {
+			fmt.Fprint(w, "hello wo")
+			return
+		}
+		fmt.Fprint(w, fullBody)
+	})
+	s := testSession(t, WithDefaultRetries(1))
+
+	var buf bytes.Buffer
+	require.NoError(t, s.Get(context.Background(), ts.URL, &buf, WithHeader("Range", "bytes=0-")))
+
+	assert.Equal(t, fullBody, buf.String())
+	assert.Equal(t, "bytes=0-", ts.record(1).Header.Get("Range"))
+	assert.Equal(t, "bytes=0-", ts.record(2).Header.Get("Range"))
+	assert.Equal(t, 2, ts.count())
+}
+
+func TestUserRangeRetryNonRewindableFailsFast(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-10/11")
+		w.Header().Set("Content-Length", "11")
+		w.WriteHeader(http.StatusPartialContent)
+		if n == 1 {
+			fmt.Fprint(w, "hello wo")
+			return
+		}
+		fmt.Fprint(w, fullBody)
+	})
+	s := testSession(t)
+
+	w := &nonRewindableWriter{}
+	err := s.Get(context.Background(), ts.URL, w,
+		WithHeader("Range", "bytes=0-"),
+		WithRetries(1),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-rewindable")
+	assert.Equal(t, 1, ts.count())
+	assert.Equal(t, "hello wo", string(w.buf))
+}
+
+func TestUserRangeRetryFileWriterRestoresBeforeRetry(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 2-10/11")
+		w.Header().Set("Content-Length", "9")
+		w.WriteHeader(http.StatusPartialContent)
+		if n == 1 {
+			fmt.Fprint(w, "llo wo")
+			return
+		}
+		fmt.Fprint(w, "llo world")
+	})
+	s := testSession(t, WithDefaultRetries(1))
+
+	path := filepath.Join(t.TempDir(), "out.bin")
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+	fw := NewFileWriter(path)
+	defer fw.Close()
+
+	require.NoError(t, s.Get(context.Background(), ts.URL, fw, WithHeader("Range", "bytes=2-")))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "hello"+"llo world", string(data))
+	assert.Equal(t, 2, ts.count())
 }

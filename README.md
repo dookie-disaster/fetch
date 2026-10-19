@@ -231,10 +231,11 @@ Notable request options: `WithHeader(s)`, `WithCookieHeader`, `WithCookies`,
   measures only newly transferred bytes. `Elapsed` spans retries in the same
   `Fetch` so progress never regresses.
 - **Redirects** — followed per attempt (up to the configured max, default 10;
-  `WithMaxRedirects(0)` disables): 301/302 rewrite non-GET/HEAD methods to
+  `WithMaxRedirects(0)` disables): 301/302/303 rewrite non-GET/HEAD methods to
   GET and drop the body (including `Content-Length`/`Content-Type` and other
-  body headers), 303 always rewrites to GET, 307/308 replay the body,
-  mirroring `net/http`. Same-origin hops re-send all headers; once a chain
+  body headers) while HEAD stays HEAD (303 does not rewrite HEAD to GET),
+  307/308 replay the body, mirroring `net/http`. Same-origin hops re-send all
+  headers; once a chain
   leaves the origin (including `https→http` downgrades) only a safelist
   (`Accept`, `Accept-Language`, `Accept-Encoding`, `Cache-Control`,
   `If-Modified-Since`, `If-None-Match`, `If-Range`, `Range`, `Content-Type`,
@@ -252,8 +253,12 @@ Notable request options: `WithHeader(s)`, `WithCookieHeader`, `WithCookies`,
 - **Resume** — `WithResume` sends `Range: bytes=<pos>-` from the writer's
   position; a `200` fallback truncates (`FileWriter.Reset`, `Truncate(0)` for
   `*os.File`, `Seek(0)` otherwise — plain seekers may retain a stale tail if
-  the re-sent body is shorter). A `416` surfaces as `*StatusError`; check the
-  local size against the expected total before re-fetching a complete file.
+  the re-sent body is shorter). If a resuming `206` covers only part of the
+  remaining range, the client keeps issuing range requests within the same
+  attempt until the advertised total from `Content-Range` is reached (bounded,
+  and only for automatic resume, not user-supplied `Range` headers). A `416`
+  surfaces as `*StatusError`; check the local size against the expected total
+  before re-fetching a complete file.
 - **FileWriter** — opens lazily, appends to partial files, truncates on
   `Reset`, removes on `Cancel` (idempotent; `Cancel` after `Close` fails so
   `Close`'s "file left on disk" promise holds). `Seek` after `Close` fails.

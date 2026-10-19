@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -86,16 +87,16 @@ func (c *sessionConfig) validate() error {
 	if c.baseURLSet {
 		u, err := url.Parse(c.baseURLRaw)
 		if err != nil {
-			return fmt.Errorf("fetch: invalid base url %q: %w", c.baseURLRaw, err)
+			return fmt.Errorf("fetch: invalid base url: %w", urlCause(err))
 		}
 		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("fetch: invalid base url %q: scheme must be http or https", c.baseURLRaw)
+			return fmt.Errorf("fetch: invalid base url %q: scheme must be http or https", redactedURLString(c.baseURLRaw))
 		}
-		if u.Host == "" {
-			return fmt.Errorf("fetch: invalid base url %q: missing host", c.baseURLRaw)
+		if u.Host == "" || u.Hostname() == "" {
+			return fmt.Errorf("fetch: invalid base url %q: missing host", redactedURLString(c.baseURLRaw))
 		}
 		if u.User != nil {
-			return fmt.Errorf("fetch: invalid base url %q: userinfo not allowed", c.baseURLRaw)
+			return fmt.Errorf("fetch: invalid base url %q: userinfo not allowed", redactedURLString(c.baseURLRaw))
 		}
 		c.baseURL = u
 	}
@@ -196,6 +197,10 @@ func WithDefaultHeaders(h http.Header) SessionOption {
 		}
 		out := make(http.Header, len(h))
 		for k, vs := range h {
+			if !isValidHeaderKey(k) {
+				out[k] = vs
+				continue
+			}
 			for _, v := range vs {
 				out.Add(k, v)
 			}
@@ -281,17 +286,17 @@ func WithDefaultMaxRedirects(n int) SessionOption {
 func validateProxyURL(proxyURL string) error {
 	u, err := url.Parse(proxyURL)
 	if err != nil {
-		return fmt.Errorf("fetch: invalid proxy url %q: %w", proxyURL, err)
+		return fmt.Errorf("fetch: invalid proxy url: %w", urlCause(err))
 	}
 	switch u.Scheme {
 	case "http", "socks5", "socks5h":
 	case "https":
-		return fmt.Errorf("fetch: invalid proxy url %q: https is not supported: the CONNECT request would be sent in plaintext, not over the TLS the scheme promises; use http, socks5 or socks5h", proxyURL)
+		return fmt.Errorf("fetch: invalid proxy url %q: https is not supported: the CONNECT request would be sent in plaintext, not over the TLS the scheme promises; use http, socks5 or socks5h", redactedURLString(proxyURL))
 	default:
-		return fmt.Errorf("fetch: invalid proxy url %q: scheme must be http, socks5 or socks5h", proxyURL)
+		return fmt.Errorf("fetch: invalid proxy url %q: scheme must be http, socks5 or socks5h", redactedURLString(proxyURL))
 	}
-	if u.Host == "" {
-		return fmt.Errorf("fetch: invalid proxy url %q: missing host", proxyURL)
+	if u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("fetch: invalid proxy url %q: missing host", redactedURLString(proxyURL))
 	}
 	return nil
 }
@@ -311,9 +316,14 @@ type requestConfig struct {
 	bodyFn           func() (io.Reader, error)
 	bodyFnCustom     bool
 	onResponse       ResponseFunc
+
+	setupErr error
 }
 
 func (rc *requestConfig) validate() error {
+	if rc.setupErr != nil {
+		return rc.setupErr
+	}
 	if rc.retryMinWait < 0 || rc.retryMaxWait < rc.retryMinWait {
 		return fmt.Errorf("fetch: invalid retry backoff: need 0 <= min <= max, got min=%v max=%v", rc.retryMinWait, rc.retryMaxWait)
 	}
@@ -412,6 +422,10 @@ func WithHeaders(h http.Header) RequestOption {
 			rc.headers = http.Header{}
 		}
 		for k, vs := range h {
+			if !isValidHeaderKey(k) {
+				rc.headers[k] = vs
+				continue
+			}
 			rc.headers.Del(k)
 			for _, v := range vs {
 				rc.headers.Add(k, v)
@@ -442,6 +456,17 @@ func WithCookieHeader(raw string) RequestOption {
 // Cookie header is already present, the new cookies are appended with "; ".
 func WithCookies(cookies ...*http.Cookie) RequestOption {
 	return func(rc *requestConfig) {
+		for _, c := range cookies {
+			if c == nil || c.Name == "" {
+				continue
+			}
+			if !isValidHeaderKey(c.Name) || !isValidHeaderValue(c.Value) || strings.ContainsRune(c.Value, ';') {
+				if rc.setupErr == nil {
+					rc.setupErr = fmt.Errorf("fetch: invalid cookie %q: name must be a valid RFC 7230 token and value must not contain CTLs or ';'", c.Name)
+				}
+				return
+			}
+		}
 		raw := serializeCookies(cookies)
 		if raw == "" {
 			return
@@ -528,7 +553,10 @@ func WithProgressInterval(d time.Duration) RequestOption {
 // ("Range: bytes=<pos>-") and the response is appended. If the server ignores
 // the range and replies 200 with the full body, the writer is rewound and the
 // download starts over. Resume also applies to every retry: after a mid-body
-// failure the next attempt continues from the bytes already written.
+// failure the next attempt continues from the bytes already written. A
+// partial 206 covering only part of the remaining range is continued
+// automatically with further range requests within the same attempt until the
+// Content-Range total is reached.
 //
 // A Range header set explicitly on the request (WithHeader("Range", ...))
 // disables the automatic negotiation for it: the caller takes over both the
@@ -604,12 +632,14 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 		maxRedirects:     s.cfg.maxRedirects,
 	}
 	for _, opt := range opts {
-		opt(rc)
+		if opt != nil {
+			opt(rc)
+		}
 	}
 	if rc.retryPolicy == nil {
 		rc.retryPolicy = DefaultRetryPolicy
 	}
-	if rc.bodyFnCustom && body != nil {
+	if rc.bodyFnCustom && !isNilReader(body) {
 		return nil, fmt.Errorf("%w: pass nil body when using WithBodyProvider", ErrBodyNotReplayable)
 	}
 	if rc.bodyFn == nil {
@@ -620,6 +650,26 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 	}
 	return rc, nil
 }
+
+// isNilInterface reports whether v is nil, including typed-nil pointers like
+// (*bytes.Reader)(nil), which are non-nil interfaces holding a nil pointer.
+func isNilInterface(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.UnsafePointer:
+		return rv.IsNil()
+	}
+	return false
+}
+
+// isNilReader reports whether r is nil or a typed-nil pointer.
+func isNilReader(r io.Reader) bool { return isNilInterface(r) }
+
+// isNilWriter reports whether w is nil or a typed-nil pointer.
+func isNilWriter(w io.Writer) bool { return isNilInterface(w) }
 
 // bodyReplayer wraps body so that each retry attempt gets a fresh reader over
 // the same content.
@@ -637,10 +687,16 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 // A body must not be shared across concurrent Fetch calls; the replay cursor
 // is per-request state.
 func bodyReplayer(body io.Reader) func() (io.Reader, error) {
+	if isNilReader(body) {
+		return func() (io.Reader, error) { return nil, nil }
+	}
 	switch b := body.(type) {
 	case nil:
 		return func() (io.Reader, error) { return nil, nil }
 	case *bytes.Buffer:
+		if b == nil {
+			return func() (io.Reader, error) { return nil, nil }
+		}
 		data := append([]byte(nil), b.Bytes()...)
 		return func() (io.Reader, error) { return bytes.NewReader(data), nil }
 	default:
@@ -648,11 +704,27 @@ func bodyReplayer(body io.Reader) func() (io.Reader, error) {
 			start, err := rs.Seek(0, io.SeekCurrent)
 			if err != nil {
 				var used atomic.Bool
+				if _, ok := rs.(io.Closer); ok {
+					return func() (io.Reader, error) {
+						if used.Swap(true) {
+							return nil, ErrBodyNotReplayable
+						}
+						return io.NopCloser(rs), nil
+					}
+				}
 				return func() (io.Reader, error) {
 					if used.Swap(true) {
 						return nil, ErrBodyNotReplayable
 					}
 					return body, nil
+				}
+			}
+			if _, ok := rs.(io.Closer); ok {
+				return func() (io.Reader, error) {
+					if _, err := rs.Seek(start, io.SeekStart); err != nil {
+						return nil, fmt.Errorf("rewind request body for replay: %w", err)
+					}
+					return io.NopCloser(rs), nil
 				}
 			}
 			return func() (io.Reader, error) {

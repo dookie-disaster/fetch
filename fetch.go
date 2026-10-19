@@ -90,7 +90,9 @@ type Session struct {
 func NewSession(opts ...SessionOption) (*Session, error) {
 	cfg := defaultSessionConfig()
 	for _, opt := range opts {
-		opt(&cfg)
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -183,8 +185,23 @@ func (s *Session) Options(ctx context.Context, url string, wr io.Writer, opts ..
 // final non-2xx response is returned as a *StatusError. When resuming is
 // enabled and wr is a seeker (for example a *FileWriter) with partial data,
 // each attempt - including retries after a mid-body failure - is sent as a
-// range request continuing from the writer's current position.
+// range request continuing from the writer's current position. A resumed 206
+// covering only part of the remaining resource is continued with further
+// range requests within the same attempt until the Content-Range total is
+// reached.
 func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Reader, wr io.Writer, opts ...RequestOption) error {
+	if ctx == nil {
+		return errors.New("fetch: nil context")
+	}
+	if !isValidHeaderKey(method) {
+		if strings.TrimSpace(method) == "" {
+			return errors.New("fetch: empty http method")
+		}
+		return fmt.Errorf("fetch: invalid http method %q", method)
+	}
+	if isNilWriter(wr) {
+		wr = nil
+	}
 	rc, err := s.newRequestConfig(opts, body)
 	if err != nil {
 		return err
@@ -192,6 +209,13 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 	target, err := s.resolveURL(rawURL)
 	if err != nil {
 		return err
+	}
+
+	// Reconcile lazily-positioned writers with the on-disk state before
+	// snapshotting the resume offset. Otherwise the Range header could be
+	// based on a stale size while the first write uses the current one.
+	if err := prepareWriter(wr); err != nil {
+		return fmt.Errorf("fetch: prepare writer: %w", err)
 	}
 
 	// Capture the writer's initial state so a retry that cannot resume can
@@ -218,6 +242,8 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		}
 		pw = NewProgressWriter(underlying, rc.progressInterval, rc.progress)
 		writerForIO = pw
+	} else if existingPW, ok := wr.(*ProgressWriter); ok && existingPW != nil {
+		pw = existingPW
 	}
 
 	var attempt int
@@ -236,9 +262,9 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		}
 		// A retry after partial bytes were committed to a non-rewindable
 		// stream would duplicate data: fail fast instead of corrupting.
-		// The caller's explicit Range takes over writer positioning, so it
-		// is exempt from this guard.
-		if attemptWrote > 0 && !userRange && !canRestoreWriter(writerForIO) {
+		// This applies to a caller-supplied Range too, since that header
+		// is static across attempts and a retry would re-send the same bytes.
+		if attemptWrote > 0 && !canRestoreWriter(writerForIO) {
 			return s.wrapFinal(method, target, attempt,
 				fmt.Errorf("fetch: cannot retry after %d bytes were written to non-rewindable writer: %w", attemptWrote, aerr))
 		}
@@ -250,10 +276,13 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		}
 		// Rewind to the initial state when the next attempt will not
 		// resume from the current position. A resumed seeker continues via
-		// Range; everything else must start clean.
-		if attemptWrote > 0 && !userRange {
+		// Range; everything else must start clean. A caller-supplied Range
+		// is static, so its retry re-sends the same bytes and must start
+		// from a clean writer (restored to the pre-Fetch state) instead of
+		// appending a second copy.
+		if attemptWrote > 0 {
 			willResume := false
-			if rc.resume {
+			if rc.resume && !userRange {
 				if pos, ok := seekerPos(writerForIO); ok && pos > 0 {
 					willResume = true
 				}
@@ -288,6 +317,8 @@ var bodyHeadersOnRewrite = []string{
 // progress is enabled, otherwise the caller's writer). It returns the
 // response info (nil on transport-level failure), the bytes written during
 // this attempt, and an error of type *StatusError for non-2xx responses.
+// A resumed 206 covering only part of the resource is continued within the
+// same attempt until the advertised total is reached.
 // attempt is the zero-based Fetch attempt number, used to populate
 // StatusError.Attempts so retry policies see the accurate count.
 func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requestConfig, wr io.Writer, pw *ProgressWriter, attempt int) (*ResponseInfo, int64, error) {
@@ -301,18 +332,36 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 	dropBody := false
 	crossOrigin := false
 	userRange := rc.headers.Get("Range") != ""
-	for hop := 0; ; hop++ {
+	// redirects counts only actual redirect follows so that
+	// range-continuation iterations within an attempt do not consume
+	// the redirect budget.
+	redirects := 0
+	// totalWrote accumulates bytes written across all range-continuation
+	// chunks within this attempt.
+	var totalWrote int64
+	rangeContinuations := 0
+	const maxRangeContinuations = 1000
+	for {
 		var bodyReader io.Reader
 		if !dropBody {
 			var err error
 			bodyReader, err = rc.bodyFn()
 			if err != nil {
-				return nil, 0, err
+				return nil, totalWrote, err
+			}
+			if isNilReader(bodyReader) {
+				bodyReader = nil
 			}
 		}
 		var getBody func() (io.Reader, error)
 		if !dropBody {
-			getBody = rc.bodyFn
+			getBody = func() (io.Reader, error) {
+				r, err := rc.bodyFn()
+				if err != nil || isNilReader(r) {
+					return nil, err
+				}
+				return r, nil
+			}
 		}
 
 		hdr := rc.headerSnapshot()
@@ -321,7 +370,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 				hdr.Del(k)
 			}
 		}
-		if rc.resume && wr != nil && !userRange {
+		if method != http.MethodHead && rc.resume && wr != nil && !userRange {
 			// The writer position is re-read on every hop: a redirect after
 			// a rewind must not carry a stale range.
 			if pos, ok := seekerPos(wr); ok && pos > 0 {
@@ -341,7 +390,16 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			Timeout: rc.timeout,
 		})
 		if err != nil {
-			return nil, 0, err
+			// On success the transport owns and closes the request body,
+			// including asynchronously on HTTP/2 and HTTP/3, so closing it
+			// here would double close or race the sender. Keep a close for
+			// error paths, where the transport may never have taken it.
+			if rc.bodyFnCustom {
+				if c, ok := bodyReader.(io.Closer); ok {
+					_ = c.Close()
+				}
+			}
+			return nil, totalWrote, err
 		}
 
 		// Redirects are followed here rather than by the client, because the
@@ -352,29 +410,29 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 				rc.onResponse(ri)
 			}
 			drainAndClose(resp)
-			if hop >= rc.maxRedirects {
+			if redirects >= rc.maxRedirects {
 				// Hand back the last 3xx alongside the error the way
 				// net/http does when it gives up on a chain; the default
 				// retry policy declines to retry a redirect loop.
-				return ri, 0, fmt.Errorf("%w (%d hops)", ErrTooManyRedirects, rc.maxRedirects)
+				return ri, totalWrote, fmt.Errorf("%w (%d hops)", ErrTooManyRedirects, rc.maxRedirects)
 			}
 			next, err := resolveReference(current, loc)
 			if err != nil {
-				return ri, 0, fmt.Errorf("fetch: bad redirect location %q: %w", loc, err)
+				return ri, totalWrote, fmt.Errorf("fetch: bad redirect location %q: %w", redactedURLString(loc), err)
 			}
 			if !sameOrigin(current, next) {
 				crossOrigin = true
 			}
 			switch resp.StatusCode {
-			case http.StatusMovedPermanently, http.StatusFound:
+			case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther:
+				dropBody = true
 				if method != http.MethodGet && method != http.MethodHead {
-					method, dropBody = http.MethodGet, true
+					method = http.MethodGet
 				}
-			case http.StatusSeeOther:
-				method, dropBody = http.MethodGet, true
 			case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 				// Method and body are preserved; bodyFn replays it.
 			}
+			redirects++
 			current = next
 			continue
 		}
@@ -386,7 +444,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			drainAndClose(resp)
-			return ri, 0, &StatusError{
+			return ri, totalWrote, &StatusError{
 				URL:        current,
 				StatusCode: resp.StatusCode,
 				Status:     statusText(resp.StatusCode),
@@ -395,12 +453,19 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			}
 		}
 
+		if method == http.MethodHead {
+			resp.Close()
+			return ri, totalWrote, nil
+		}
+
 		// Resume negotiation: the writer already holds some bytes. A
 		// user-supplied Range header takes over range handling entirely,
 		// so the automatic logic stays out of the way.
 		var resumePos int64
 		var expectedLen = ri.ContentLength
 		var total = ri.ContentLength
+		var isResumedPartial bool
+		var resumedTotal int64
 		if !userRange && rc.resume && wr != nil {
 			if pos, ok := seekerPos(wr); ok && pos > 0 {
 				resumePos = pos
@@ -409,20 +474,22 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 					start, end, crTotal, ok := parseContentRange(ri.Headers.Get("Content-Range"))
 					if !ok {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: resume mismatch: 206 response missing valid Content-Range for bytes from %d", pos)
+						return ri, totalWrote, fmt.Errorf("fetch: resume mismatch: 206 response missing valid Content-Range for bytes from %d", pos)
 					}
 					if start != pos {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: resume mismatch: requested bytes from %d but server sent Content-Range starting at %d", pos, start)
+						return ri, totalWrote, fmt.Errorf("fetch: resume mismatch: requested bytes from %d but server sent Content-Range starting at %d", pos, start)
 					}
 					rangeLen := end - start + 1
 					if ri.ContentLength >= 0 && ri.ContentLength != rangeLen {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: resume mismatch: Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
+						return ri, totalWrote, fmt.Errorf("fetch: resume mismatch: Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
 					}
 					expectedLen = rangeLen
 					if crTotal >= 0 {
 						total = crTotal
+						isResumedPartial = true
+						resumedTotal = crTotal
 					} else if ri.ContentLength >= 0 {
 						total = pos + ri.ContentLength
 					} else {
@@ -437,7 +504,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 					// resetWriter).
 					if err := resetWriter(wr); err != nil {
 						drainAndClose(resp)
-						return ri, 0, fmt.Errorf("fetch: reset writer after ignored range request: %w", err)
+						return ri, totalWrote, fmt.Errorf("fetch: reset writer after ignored range request: %w", err)
 					}
 					resumePos = 0
 					expectedLen = ri.ContentLength
@@ -457,11 +524,11 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			}
 			if !ok || start != 0 || crTotal < 0 || end+1 != crTotal {
 				drainAndClose(resp)
-				return ri, 0, fmt.Errorf("fetch: unexpected 206 response without range request (Content-Range %q)", ri.Headers.Get("Content-Range"))
+				return ri, totalWrote, fmt.Errorf("fetch: unexpected 206 response without range request (Content-Range %q)", ri.Headers.Get("Content-Range"))
 			}
 			if ri.ContentLength >= 0 && ri.ContentLength != rangeLen {
 				drainAndClose(resp)
-				return ri, 0, fmt.Errorf("fetch: 206 Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
+				return ri, totalWrote, fmt.Errorf("fetch: 206 Content-Length %d disagrees with Content-Range bytes %d-%d/%d", ri.ContentLength, start, end, crTotal)
 			}
 			expectedLen = rangeLen
 			total = crTotal
@@ -476,13 +543,14 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 			}
 		}
 
-		attemptWrote, cerr := copyBody(resp, expectedLen, wr, pw)
+		chunkWrote, cerr := copyBody(resp, expectedLen, wr, pw)
 		resp.Close()
+		totalWrote += chunkWrote
 		if cerr != nil {
 			// Write-side failures (disk full, ...) are not retryable by the
 			// default policy; read-side failures carry
 			// ErrIncompleteResponse and are.
-			return ri, attemptWrote, cerr
+			return ri, totalWrote, cerr
 		}
 
 		// A server that closes the connection early must not count as
@@ -491,16 +559,25 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 		// no body at all but still carry the Content-Length a GET would
 		// produce, so the check does not apply to them.
 		if method != http.MethodHead && expectedLen >= 0 {
-			if attemptWrote < expectedLen {
-				return ri, attemptWrote, fmt.Errorf("fetch: incomplete response body: got %d of %d bytes: %w", attemptWrote, expectedLen, ErrIncompleteResponse)
+			if chunkWrote < expectedLen {
+				return ri, totalWrote, fmt.Errorf("fetch: incomplete response body: got %d of %d bytes: %w", chunkWrote, expectedLen, ErrIncompleteResponse)
 			}
 			// Overshoot is already truncated in copyBody; reaching here
 			// with more bytes is impossible, but keep the guard explicit.
-			if attemptWrote > expectedLen {
-				return ri, attemptWrote, fmt.Errorf("fetch: response body longer than advertised: got %d of %d bytes: %w", attemptWrote, expectedLen, ErrIncompleteResponse)
+			if chunkWrote > expectedLen {
+				return ri, totalWrote, fmt.Errorf("fetch: response body longer than advertised: got %d of %d bytes: %w", chunkWrote, expectedLen, ErrIncompleteResponse)
 			}
 		}
-		return ri, attemptWrote, nil
+		if isResumedPartial && method != http.MethodHead {
+			if endPos := resumePos + chunkWrote; endPos < resumedTotal {
+				rangeContinuations++
+				if rangeContinuations > maxRangeContinuations {
+					return ri, totalWrote, fmt.Errorf("fetch: too many range continuations without completing %d bytes: %w", resumedTotal, ErrIncompleteResponse)
+				}
+				continue
+			}
+		}
+		return ri, totalWrote, nil
 	}
 }
 
@@ -646,22 +723,22 @@ func (s *Session) wrapFinal(method, target string, attempt int, err error) error
 func (s *Session) resolveURL(rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return "", fmt.Errorf("fetch: invalid url %q: %w", rawURL, err)
+		return "", fmt.Errorf("fetch: invalid url: %w", urlCause(err))
 	}
 	if s.cfg.baseURL != nil && !u.IsAbs() {
 		u = s.cfg.baseURL.ResolveReference(u)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		if u.Scheme == "" || u.Host == "" {
-			return "", fmt.Errorf("fetch: invalid url %q: missing scheme or host", rawURL)
+		if u.Scheme == "" || u.Host == "" || u.Hostname() == "" {
+			return "", fmt.Errorf("fetch: invalid url %q: missing scheme or host", redactedURLString(rawURL))
 		}
-		return "", fmt.Errorf("fetch: invalid url %q: scheme must be http or https", rawURL)
+		return "", fmt.Errorf("fetch: invalid url %q: scheme must be http or https", redactedURLString(rawURL))
 	}
-	if u.Host == "" {
-		return "", fmt.Errorf("fetch: invalid url %q: missing host", rawURL)
+	if u.Host == "" || u.Hostname() == "" {
+		return "", fmt.Errorf("fetch: invalid url %q: missing host", redactedURLString(rawURL))
 	}
 	if u.User != nil {
-		return "", fmt.Errorf("fetch: invalid url %q: userinfo not allowed", rawURL)
+		return "", fmt.Errorf("fetch: invalid url %q: userinfo not allowed", redactedURLString(rawURL))
 	}
 	return u.String(), nil
 }
@@ -673,11 +750,11 @@ func (s *Session) resolveURL(rawURL string) (string, error) {
 func resolveReference(base, ref string) (string, error) {
 	r, err := url.Parse(ref)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetch: invalid redirect location: %w", urlCause(err))
 	}
 	b, err := url.Parse(base)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetch: invalid redirect location: %w", urlCause(err))
 	}
 	var resolved *url.URL
 	if r.IsAbs() {
@@ -686,16 +763,16 @@ func resolveReference(base, ref string) (string, error) {
 		resolved = b.ResolveReference(r)
 	}
 	if resolved.Scheme != "http" && resolved.Scheme != "https" {
-		if resolved.Scheme == "" || resolved.Host == "" {
-			return "", fmt.Errorf("fetch: invalid redirect location %q: missing scheme or host", ref)
+		if resolved.Scheme == "" || resolved.Host == "" || resolved.Hostname() == "" {
+			return "", fmt.Errorf("fetch: invalid redirect location %q: missing scheme or host", redactedURLString(ref))
 		}
-		return "", fmt.Errorf("fetch: invalid redirect location %q: scheme must be http or https", ref)
+		return "", fmt.Errorf("fetch: invalid redirect location %q: scheme must be http or https", redactedURLString(ref))
 	}
-	if resolved.Host == "" {
-		return "", fmt.Errorf("fetch: invalid redirect location %q: missing host", ref)
+	if resolved.Host == "" || resolved.Hostname() == "" {
+		return "", fmt.Errorf("fetch: invalid redirect location %q: missing host", redactedURLString(ref))
 	}
 	if resolved.User != nil {
-		return "", fmt.Errorf("fetch: invalid redirect location %q: userinfo not allowed", ref)
+		return "", fmt.Errorf("fetch: invalid redirect location %q: userinfo not allowed", redactedURLString(ref))
 	}
 	return resolved.String(), nil
 }

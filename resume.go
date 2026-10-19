@@ -3,6 +3,7 @@ package fetch
 import (
 	"bytes"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -24,18 +25,37 @@ func seekerPos(w io.Writer) (int64, bool) {
 	return pos, true
 }
 
+// unwrapWriter unwraps all *ProgressWriter layers, returning the underlying
+// writer. It stops if w is not a *ProgressWriter or is a nil *ProgressWriter.
+func unwrapWriter(w io.Writer) io.Writer {
+	for {
+		pw, ok := w.(*ProgressWriter)
+		if !ok || pw == nil {
+			return w
+		}
+		w = pw.Unwrap()
+	}
+}
+
+// prepareWriter lets a lazily-positioned writer reconcile with external state
+// before Fetch snapshots the resume offset. Only *FileWriter implements it;
+// other writers are unaffected.
+func prepareWriter(w io.Writer) error {
+	w = unwrapWriter(w)
+	if w == nil {
+		return nil
+	}
+	if p, ok := w.(interface{ prepare() error }); ok {
+		return p.prepare()
+	}
+	return nil
+}
+
 // bufferLen reports the length of w when w is (or wraps) a *bytes.Buffer.
 func bufferLen(w io.Writer) (int, bool) {
-	if b, ok := w.(*bytes.Buffer); ok {
+	w = unwrapWriter(w)
+	if b, ok := w.(*bytes.Buffer); ok && b != nil {
 		return b.Len(), true
-	}
-	if pw, ok := w.(*ProgressWriter); ok {
-		if b, ok := pw.Unwrap().(*bytes.Buffer); ok {
-			return b.Len(), true
-		}
-		if inner, ok := pw.Unwrap().(*ProgressWriter); ok {
-			return bufferLen(inner)
-		}
 	}
 	return 0, false
 }
@@ -44,14 +64,12 @@ func bufferLen(w io.Writer) (int, bool) {
 // possibly wrapped in a ProgressWriter). Retrying after a partial write is
 // safe for discarded output.
 func isDiscard(w io.Writer) bool {
+	w = unwrapWriter(w)
 	if w == nil {
 		return true
 	}
 	if w == io.Discard {
 		return true
-	}
-	if pw, ok := w.(*ProgressWriter); ok {
-		return isDiscard(pw.Unwrap())
 	}
 	return false
 }
@@ -111,80 +129,61 @@ func resetWriter(w io.Writer) error {
 // starts clean. initPos/initSeekOK come from seekerPos(w) before the first
 // attempt; initBufLen/initBufOK come from bufferLen(w).
 func restoreWriterToInitial(w io.Writer, initPos int64, initSeekOK bool, initBufLen int, initBufOK bool) error {
-	if isDiscard(w) {
+	// Reset progress counters on all *ProgressWriter wrappers.
+	for tmp := w; ; {
+		pw, ok := tmp.(*ProgressWriter)
+		if !ok || pw == nil {
+			break
+		}
+		pw.SetWritten(0)
+		tmp = pw.Unwrap()
+	}
+	under := unwrapWriter(w)
+	if under == nil {
+		return nil
+	}
+	if pw, ok := under.(*ProgressWriter); ok && pw == nil {
+		return nil
+	}
+	if under == io.Discard {
 		return nil
 	}
 	// Buffers restore by length, independent of seeking.
 	if initBufOK {
-		if b, ok := w.(*bytes.Buffer); ok {
+		if b, ok := under.(*bytes.Buffer); ok && b != nil {
 			b.Truncate(initBufLen)
-			return nil
 		}
-		if pw, ok := w.(*ProgressWriter); ok {
-			if b, ok := pw.Unwrap().(*bytes.Buffer); ok {
-				b.Truncate(initBufLen)
-				pw.SetWritten(0)
-				return nil
-			}
-		}
-	}
-	if !initSeekOK {
 		return nil
 	}
-	// Seekable writers: truncate any partial tail beyond initPos when
-	// possible, then seek back.
-	if pw, ok := w.(*ProgressWriter); ok {
-		under := pw.Unwrap()
-		if fw, ok := under.(*FileWriter); ok {
-			if err := fw.truncateTo(initPos); err != nil {
-				return err
-			}
-			pw.SetWritten(0)
-			return nil
+	if initSeekOK {
+		// Seekable writers: truncate any partial tail beyond initPos when
+		// possible, then seek back.
+		if fw, ok := under.(*FileWriter); ok && fw != nil {
+			return fw.truncateTo(initPos)
 		}
 		if t, ok := under.(truncater); ok {
-			// Truncate partial tail, then seek. Best effort on seek:
-			// Truncate succeeded so the size is right even if Seek fails.
-			_ = t.Truncate(initPos)
-			if s, ok := under.(io.Seeker); ok {
-				if _, err := s.Seek(initPos, io.SeekStart); err != nil {
-					// If the seek fails the position is unknown; surface it
-					// so the retry does not append at the wrong offset.
-					return err
-				}
+			if err := t.Truncate(initPos); err != nil {
+				return err
 			}
-			pw.SetWritten(0)
+			if s, ok := under.(io.Seeker); ok {
+				_, err := s.Seek(initPos, io.SeekStart)
+				return err
+			}
 			return nil
 		}
 		if s, ok := under.(io.Seeker); ok {
-			if _, err := s.Seek(initPos, io.SeekStart); err != nil {
-				return err
-			}
-			pw.SetWritten(0)
-			return nil
-		}
-		// Fall through to generic handling via pw.Seek.
-		if _, err := pw.Seek(initPos, io.SeekStart); err != nil {
+			_, err := s.Seek(initPos, io.SeekStart)
 			return err
 		}
-		pw.SetWritten(0)
 		return nil
 	}
-	if fw, ok := w.(*FileWriter); ok {
-		return fw.truncateTo(initPos)
+	// Non-seekable, non-buffer writers: reset truncating writers so a retry
+	// does not append onto partial bytes.
+	if r, ok := under.(reseter); ok {
+		return r.Reset()
 	}
-	if t, ok := w.(truncater); ok {
-		_ = t.Truncate(initPos)
-		if s, ok := w.(io.Seeker); ok {
-			if _, err := s.Seek(initPos, io.SeekStart); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if s, ok := w.(io.Seeker); ok {
-		_, err := s.Seek(initPos, io.SeekStart)
-		return err
+	if t, ok := under.(truncater); ok {
+		return t.Truncate(0)
 	}
 	return nil
 }
@@ -194,13 +193,20 @@ func restoreWriterToInitial(w io.Writer, initPos int64, initSeekOK bool, initBuf
 // discarded output are restorable; any other streaming writer is not, and a
 // retry after partial bytes would duplicate data.
 func canRestoreWriter(w io.Writer) bool {
+	w = unwrapWriter(w)
+	if w == nil {
+		return true
+	}
+	if pw, ok := w.(*ProgressWriter); ok && pw == nil {
+		return true
+	}
 	if isDiscard(w) {
 		return true
 	}
 	if _, ok := bufferLen(w); ok {
 		return true
 	}
-	if _, ok := w.(io.Seeker); ok {
+	if _, ok := seekerPos(w); ok {
 		return true
 	}
 	if _, ok := w.(reseter); ok {
@@ -209,13 +215,7 @@ func canRestoreWriter(w io.Writer) bool {
 	if _, ok := w.(truncater); ok {
 		return true
 	}
-	if _, ok := w.(*bytes.Buffer); ok {
-		return true
-	}
-	if pw, ok := w.(*ProgressWriter); ok {
-		return canRestoreWriter(pw.Unwrap())
-	}
-	if w == nil {
+	if b, ok := w.(*bytes.Buffer); ok && b != nil {
 		return true
 	}
 	return false
@@ -271,7 +271,7 @@ func parseContentRange(v string) (start, end, total int64, ok bool) {
 		return 0, 0, total, false
 	}
 	e, err := strconv.ParseInt(strings.TrimSpace(rangePart[dash+1:]), 10, 64)
-	if err != nil || e < 0 || e < s {
+	if err != nil || e < 0 || e < s || e == math.MaxInt64 {
 		return 0, 0, total, false
 	}
 	if total >= 0 && e >= total {
@@ -279,5 +279,3 @@ func parseContentRange(v string) (start, end, total int64, ok bool) {
 	}
 	return s, e, total, true
 }
-
-

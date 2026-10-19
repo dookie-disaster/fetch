@@ -179,3 +179,56 @@ func TestRedirectWithResume(t *testing.T) {
 	assert.Equal(t, fullBody, string(data))
 	assert.Equal(t, "bytes=5-", ts.record(2).Header.Get("Range"), "range recomputed for the redirect target")
 }
+
+func TestRedirectHeadAcross303PreservesHead(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect":
+			http.Redirect(w, r, "/target", http.StatusSeeOther)
+		case "/target":
+			w.Header().Set("Content-Length", "1048576")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	s := testSession(t, WithDefaultRetries(0))
+
+	require.NoError(t, s.Head(context.Background(), ts.URL+"/redirect"))
+
+	require.Equal(t, 2, ts.count())
+	assert.Equal(t, http.MethodHead, ts.record(1).Method)
+	assert.Equal(t, http.MethodHead, ts.record(2).Method, "303 must not rewrite HEAD to GET")
+}
+
+func TestRedirectGetWithOneShotBodyDropsBodyOn302(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect":
+			http.Redirect(w, r, "/target", http.StatusFound)
+		case "/target":
+			fmt.Fprint(w, "ok")
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	s := testSession(t)
+
+	var buf bytes.Buffer
+	err := s.Fetch(context.Background(), http.MethodGet, ts.URL+"/redirect",
+		&oneShotReader{data: "x"}, &buf,
+		WithHeader("Content-Type", "text/plain"),
+		WithHeader("Content-Length", "1"))
+	require.NoError(t, err)
+	assert.NotErrorIs(t, err, ErrBodyNotReplayable)
+	assert.Equal(t, "ok", buf.String())
+
+	require.Equal(t, 2, ts.count())
+	assert.Equal(t, "x", string(ts.record(1).Body))
+	assert.Equal(t, "text/plain", ts.record(1).Header.Get("Content-Type"))
+	rec := ts.record(2)
+	assert.Equal(t, http.MethodGet, rec.Method)
+	assert.Empty(t, rec.Body, "the body is dropped on the GET redirect")
+	assert.Empty(t, rec.Header.Get("Content-Type"), "body headers are dropped on the GET rewrite")
+	assert.Empty(t, rec.Header.Get("Content-Length"), "body headers are dropped on the GET rewrite")
+}

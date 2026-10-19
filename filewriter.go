@@ -60,7 +60,7 @@ type FileWriter struct {
 	canceled    bool
 	syncOnClose bool
 	// seeked tracks whether Seek was called explicitly. ensureOpen only
-	// clamps pos to the on-disk size when pos still came from the initial
+	// reconciles pos to the on-disk size when pos still came from the initial
 	// NewFileWriter stat; an explicit Seek past EOF must be honored so the
 	// next write creates a sparse hole instead of being silently rewound.
 	seeked bool
@@ -76,7 +76,9 @@ var _ io.WriteSeeker = (*FileWriter)(nil)
 func NewFileWriter(path string, opts ...FileOption) *FileWriter {
 	fw := &FileWriter{path: path, perm: 0o644}
 	for _, opt := range opts {
-		opt(fw)
+		if opt != nil {
+			opt(fw)
+		}
 	}
 	if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() {
 		fw.pos = st.Size()
@@ -142,7 +144,11 @@ func (fw *FileWriter) Seek(offset int64, whence int) (int64, error) {
 				size = st.Size()
 			}
 		} else if st, err := os.Stat(fw.path); err == nil {
-			size = st.Size()
+			if st.Mode().IsRegular() {
+				size = st.Size()
+			}
+		} else if errors.Is(err, fs.ErrNotExist) && !fw.seeked {
+			size = 0
 		}
 		np = size + offset
 	default:
@@ -157,7 +163,9 @@ func (fw *FileWriter) Seek(offset int64, whence int) (int64, error) {
 		}
 	}
 	fw.pos = np
-	fw.seeked = true
+	if !(whence == io.SeekCurrent && offset == 0) {
+		fw.seeked = true
+	}
 	return np, nil
 }
 
@@ -224,7 +232,7 @@ func (fw *FileWriter) resetLocked() error {
 				return err
 			}
 		}
-	} else if fw.pos > 0 {
+	} else if fw.path != "" {
 		if err := os.Truncate(fw.path, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -234,11 +242,21 @@ func (fw *FileWriter) resetLocked() error {
 	return nil
 }
 
+// Truncate discards session bytes beyond pos, restoring the file to the
+// size it had before a failed attempt. pos == 0 is equivalent to Reset.
+func (fw *FileWriter) Truncate(pos int64) error {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	return fw.truncateLocked(pos)
+}
+
 // truncateTo discards session bytes beyond pos, restoring the file to the
 // size it had before a failed attempt. pos == 0 is equivalent to Reset.
 func (fw *FileWriter) truncateTo(pos int64) error {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+	return fw.Truncate(pos)
+}
+
+func (fw *FileWriter) truncateLocked(pos int64) error {
 	if fw.closed {
 		return os.ErrClosed
 	}
@@ -254,6 +272,11 @@ func (fw *FileWriter) truncateTo(pos int64) error {
 		}
 		if _, err := fw.f.Seek(pos, io.SeekStart); err != nil {
 			return err
+		}
+		if fw.syncOnClose {
+			if err := fw.f.Sync(); err != nil {
+				return err
+			}
 		}
 	} else {
 		// Unopened: shrink the on-disk file when it grew past pos.
@@ -295,6 +318,34 @@ func (fw *FileWriter) Cancel() error {
 	return err
 }
 
+// prepare reconciles the implicit position with the on-disk size and pins it
+// before the first write. Fetch calls it before reading the position for a
+// resume range, so the range header and the eventual write start at the same
+// offset even if the file changed after NewFileWriter. An explicit Seek or an
+// already-open file is authoritative and left untouched.
+func (fw *FileWriter) prepare() error {
+	if fw == nil {
+		return nil
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.closed {
+		return os.ErrClosed
+	}
+	if fw.f != nil || fw.seeked {
+		return nil
+	}
+	if st, err := os.Stat(fw.path); err == nil {
+		if st.Mode().IsRegular() {
+			fw.pos = st.Size()
+		}
+	} else if errors.Is(err, fs.ErrNotExist) {
+		fw.pos = 0
+	}
+	fw.seeked = true
+	return nil
+}
+
 // ensureOpen opens the file and positions it at the writer's logical
 // position. It must be called with fw.mu held.
 func (fw *FileWriter) ensureOpen() error {
@@ -314,13 +365,11 @@ func (fw *FileWriter) ensureOpen() error {
 	// Reconcile with on-disk state to avoid sparse holes or stale positions
 	// when the file changed between NewFileWriter and the first write. An
 	// explicit Seek past EOF is honored (sparse hole); only the implicit
-	// position from the initial stat is clamped.
+	// position from the initial stat is reconciled to the on-disk size
+	// (both shrink and growth).
 	if !fw.seeked {
 		if st, err := f.Stat(); err == nil {
-			size := st.Size()
-			if fw.pos > size {
-				fw.pos = size
-			}
+			fw.pos = st.Size()
 		}
 	}
 	if fw.pos > 0 {
