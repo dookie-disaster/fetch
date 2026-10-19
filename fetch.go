@@ -185,6 +185,15 @@ func (s *Session) Options(ctx context.Context, url string, wr io.Writer, opts ..
 // each attempt - including retries after a mid-body failure - is sent as a
 // range request continuing from the writer's current position.
 func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Reader, wr io.Writer, opts ...RequestOption) error {
+	if ctx == nil {
+		return errors.New("fetch: nil context")
+	}
+	if !isValidHeaderKey(method) {
+		if strings.TrimSpace(method) == "" {
+			return errors.New("fetch: empty http method")
+		}
+		return fmt.Errorf("fetch: invalid http method %q", method)
+	}
 	rc, err := s.newRequestConfig(opts, body)
 	if err != nil {
 		return err
@@ -323,7 +332,7 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 				hdr.Del(k)
 			}
 		}
-		if rc.resume && wr != nil && !userRange {
+		if method != http.MethodHead && rc.resume && wr != nil && !userRange {
 			// The writer position is re-read on every hop: a redirect after
 			// a rewind must not carry a stale range.
 			if pos, ok := seekerPos(wr); ok && pos > 0 {
@@ -373,12 +382,11 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 				crossOrigin = true
 			}
 			switch resp.StatusCode {
-			case http.StatusMovedPermanently, http.StatusFound:
+			case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther:
+				dropBody = true
 				if method != http.MethodGet && method != http.MethodHead {
-					method, dropBody = http.MethodGet, true
+					method = http.MethodGet
 				}
-			case http.StatusSeeOther:
-				method, dropBody = http.MethodGet, true
 			case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 				// Method and body are preserved; bodyFn replays it.
 			}
@@ -400,6 +408,11 @@ func (s *Session) doAttempt(ctx context.Context, method, target string, rc *requ
 				Headers:    ri.Headers,
 				Attempts:   attempt + 1,
 			}
+		}
+
+		if method == http.MethodHead {
+			resp.Close()
+			return ri, 0, nil
 		}
 
 		// Resume negotiation: the writer already holds some bytes. A

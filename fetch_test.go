@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -339,4 +341,46 @@ func TestConcurrentGets(t *testing.T) {
 		assert.NoError(t, err)
 	}
 	assert.Equal(t, 20, ts.count())
+}
+
+func TestFetchNilContextAndInvalidMethod(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	s := testSession(t)
+
+	err := s.Fetch(nil, http.MethodGet, ts.URL, nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil context")
+	assert.Equal(t, 0, ts.count(), "nil context must fail before sending")
+
+	err = s.Fetch(context.Background(), "", ts.URL, nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty http method")
+	assert.Equal(t, 0, ts.count(), "empty method must fail before sending")
+
+	err = s.Fetch(context.Background(), "BAD METHOD\r\n", ts.URL, nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid http method")
+	assert.Equal(t, 0, ts.count(), "invalid method must fail before sending")
+}
+
+func TestFetchHeadWithResumeDoesNotSendRangeOrTruncate(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "11")
+		w.WriteHeader(http.StatusOK)
+	})
+	s := testSession(t, WithDefaultResume(true))
+
+	path := filepath.Join(t.TempDir(), "out.bin")
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+	fw := NewFileWriter(path)
+	defer fw.Close()
+
+	require.NoError(t, s.Fetch(context.Background(), http.MethodHead, ts.URL, nil, fw))
+
+	assert.Empty(t, ts.record(1).Header.Get("Range"), "HEAD must not send an automatic Range header")
+	assert.Equal(t, http.MethodHead, ts.record(1).Method)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(data), "HEAD must not truncate the partial file")
 }
