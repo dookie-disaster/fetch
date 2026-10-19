@@ -185,7 +185,10 @@ func (s *Session) Options(ctx context.Context, url string, wr io.Writer, opts ..
 // final non-2xx response is returned as a *StatusError. When resuming is
 // enabled and wr is a seeker (for example a *FileWriter) with partial data,
 // each attempt - including retries after a mid-body failure - is sent as a
-// range request continuing from the writer's current position.
+// range request continuing from the writer's current position. A resumed 206
+// covering only part of the remaining resource is continued with further
+// range requests within the same attempt until the Content-Range total is
+// reached.
 func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Reader, wr io.Writer, opts ...RequestOption) error {
 	if ctx == nil {
 		return errors.New("fetch: nil context")

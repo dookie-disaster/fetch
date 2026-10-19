@@ -265,5 +265,3 @@ func parseContentRange(v string) (start, end, total int64, ok bool) {
 	}
 	return s, e, total, true
 }
-
-

@@ -552,7 +552,10 @@ func WithProgressInterval(d time.Duration) RequestOption {
 // ("Range: bytes=<pos>-") and the response is appended. If the server ignores
 // the range and replies 200 with the full body, the writer is rewound and the
 // download starts over. Resume also applies to every retry: after a mid-body
-// failure the next attempt continues from the bytes already written.
+// failure the next attempt continues from the bytes already written. A
+// partial 206 covering only part of the remaining range is continued
+// automatically with further range requests within the same attempt until the
+// Content-Range total is reached.
 //
 // A Range header set explicitly on the request (WithHeader("Range", ...))
 // disables the automatic negotiation for it: the caller takes over both the
