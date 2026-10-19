@@ -639,7 +639,7 @@ func (s *Session) newRequestConfig(opts []RequestOption, body io.Reader) (*reque
 	if rc.retryPolicy == nil {
 		rc.retryPolicy = DefaultRetryPolicy
 	}
-	if rc.bodyFnCustom && body != nil {
+	if rc.bodyFnCustom && !isNilReader(body) {
 		return nil, fmt.Errorf("%w: pass nil body when using WithBodyProvider", ErrBodyNotReplayable)
 	}
 	if rc.bodyFn == nil {

@@ -40,6 +40,15 @@ func TestFetchTypedNilBodyDoesNotPanic(t *testing.T) {
 	require.NoError(t, s.Post(context.Background(), ts.URL, sr, nil))
 }
 
+func TestBodyProviderConflictTypedNilBodyAllowed(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+	s := testSession(t)
+	var br *bytes.Reader // typed-nil body
+	require.NoError(t, s.Post(context.Background(), ts.URL, br, nil,
+		WithBodyProvider(func() (io.Reader, error) { return strings.NewReader("y"), nil })))
+	assert.Equal(t, "y", string(ts.record(1).Body))
+}
+
 func TestWithBodyProviderClosesOnSuccess(t *testing.T) {
 	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
 	s := testSession(t)
