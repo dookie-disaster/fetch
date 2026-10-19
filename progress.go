@@ -161,7 +161,8 @@ func (pw *ProgressWriter) Seek(offset int64, whence int) (int64, error) {
 // Reset discards the underlying contents (truncating to zero) and resets
 // progress counters to 0. It forwards to Reset() error, *bytes.Buffer, or
 // Truncate(0)+Seek(0) where available, falling back to Seek(0) for plain
-// seekers.
+// seekers. It returns an error when the underlying writer cannot be reset,
+// leaving the progress counters unchanged in that case.
 func (pw *ProgressWriter) Reset() error {
 	if r, ok := pw.w.(interface{ Reset() error }); ok {
 		if err := r.Reset(); err != nil {
@@ -201,8 +202,7 @@ func (pw *ProgressWriter) Reset() error {
 		pw.SetWritten(0)
 		return nil
 	}
-	pw.SetWritten(0)
-	return nil
+	return fmt.Errorf("fetch: ProgressWriter: underlying writer does not support reset")
 }
 
 // Truncate forwards Truncate(n) to the underlying writer when supported.
