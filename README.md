@@ -76,7 +76,8 @@ if errors.As(err, &se) {
 ## Downloads with progress and automatic resume
 
 ```go
-fw := fetch.NewFileWriter("/tmp/big.iso") // file is NOT opened yet
+// File is NOT opened until the first write.
+fw := fetch.NewFileWriter("/tmp/big.iso", fetch.WithFileHash(sha256.New()))
 defer fw.Close()
 
 err := s.Get(ctx, "https://example.com/big.iso", fw,
@@ -86,6 +87,14 @@ err := s.Get(ctx, "https://example.com/big.iso", fw,
 			st.Written, st.Total, st.BytesPerSec/1e6)
 	}),
 )
+if err == nil {
+	sum, err := fw.Sum()
+	if err != nil {
+		log.Printf("checksum failed: %v", err)
+	} else {
+		log.Printf("sha256: %x", sum)
+	}
+}
 ```
 
 - `NewFileWriter` stats the path up front: an existing partial file makes the
@@ -95,6 +104,12 @@ err := s.Get(ctx, "https://example.com/big.iso", fw,
   writer is rewound (and truncated) and the download starts over.
 - If the transfer dies mid-body, the retry continues from the bytes already
   on disk — `Range: bytes=<pos>-` is recomputed for every attempt.
+- `WithFileHash` maintains a digest of the complete file as bytes arrive, and
+  `fw.Sum()` returns it. Existing bytes in a resumed file are included: they
+  are read once from disk to seed the hash before the first new write. Fresh
+  downloads add no extra read. The supplied hash is reset and owned by the
+  writer. `Sum` fails when the file is shorter than the writer's position (an
+  unwritten sparse gap after `Seek` past EOF has no bytes to digest yet).
 - To abort and discard the partial file, call `fw.Cancel()`.
 
 ## Retries
@@ -264,7 +279,8 @@ Notable request options: `WithHeader(s)`, `WithCookieHeader`, `WithCookies`,
   `Close`'s "file left on disk" promise holds). `Seek` after `Close` fails.
   One writer per concurrent download; methods are individually thread-safe but
   check-then-act sequences are not atomic. `WithFileSync(true)` fsyncs on
-  `Close`/`Reset`.
+  `Close`/`Reset`; `WithFileHash` streams a full-file digest returned by
+  `Sum` (available after `Close` too).
 - **Conditional caching** — the underlying httpcloak session's
   ETag/If-Modified-Since handling is disabled at construction, because this
   layer must always receive full bodies. Re-enable it via `Client()` if you

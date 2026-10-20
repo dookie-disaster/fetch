@@ -3,6 +3,7 @@ package fetch
 import (
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -35,6 +36,22 @@ func WithFileSync(enabled bool) FileOption {
 	}
 }
 
+// WithFileHash makes the writer feed every byte written to h so Sum can
+// return a digest of the complete file, including any partial data that is
+// already on disk when the digest is first computed. h is reset when the
+// option is applied and is owned by the writer; it must not be used
+// concurrently. Passing nil is ignored.
+func WithFileHash(h hash.Hash) FileOption {
+	return func(fw *FileWriter) {
+		if h == nil {
+			return
+		}
+		h.Reset()
+		fw.hash = h
+		fw.hashPos = 0
+	}
+}
+
 // FileWriter is an io.WriteSeeker that opens its file lazily, on demand,
 // when the first write (or seek) happens. It is meant for download workers
 // that queue work behind a semaphore: the writer can be created - and carry
@@ -50,6 +67,9 @@ func WithFileSync(enabled bool) FileOption {
 // the position (Seek) and then writes, and that check-then-act sequence is
 // not atomic across goroutines. Give each concurrent download its own
 // FileWriter.
+//
+// WithFileHash optionally maintains a digest of the complete file as data is
+// written; Sum returns it.
 type FileWriter struct {
 	mu          sync.Mutex
 	path        string
@@ -64,6 +84,11 @@ type FileWriter struct {
 	// NewFileWriter stat; an explicit Seek past EOF must be honored so the
 	// next write creates a sparse hole instead of being silently rewound.
 	seeked bool
+	// hash, when non-nil, covers the complete file from offset 0. hashPos is
+	// the number of leading file bytes represented by hash; -1 means the hash
+	// state is stale and must be rebuilt from disk before it is used again.
+	hash    hash.Hash
+	hashPos int64
 }
 
 // Compile-time check: a FileWriter can be used anywhere the fetch resume
@@ -97,12 +122,106 @@ func (fw *FileWriter) Pos() int64 {
 	return fw.pos
 }
 
+// Sum returns the digest of the complete file from offset 0 through the
+// writer's current position, including any partial data that was on disk when
+// the writer was created. It returns an error when no hash was configured
+// with WithFileHash, after Cancel, and when the file is shorter than the
+// writer's position: bytes past the end of the file (an unwritten sparse gap
+// after Seek past EOF) have no file content to digest yet. Sum may be called
+// after Close.
+func (fw *FileWriter) Sum() ([]byte, error) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.canceled {
+		return nil, os.ErrClosed
+	}
+	if fw.hash == nil {
+		return nil, fmt.Errorf("fetch: FileWriter.Sum: no hash configured")
+	}
+	if fw.pos > 0 {
+		st, err := os.Stat(fw.path)
+		if err != nil {
+			return nil, fmt.Errorf("fetch: FileWriter.Sum: %w", err)
+		}
+		if st.Size() < fw.pos {
+			return nil, fmt.Errorf("fetch: FileWriter.Sum: file is %d bytes, shorter than the writer position %d", st.Size(), fw.pos)
+		}
+	}
+	if err := fw.hashSyncLocked(fw.pos); err != nil {
+		return nil, err
+	}
+	return fw.hash.Sum(nil), nil
+}
+
+// hashSyncLocked makes the hash represent exactly the file bytes in
+// [0, to). It must be called with fw.mu held. Rehashing from disk is needed
+// when a resumed file already has a prefix, after a rewind/truncate, or when a
+// sparse gap has to be represented as zero bytes. Zero padding stands in for
+// hole bytes that the next write materializes; Sum refuses to report a digest
+// while such a gap is still shorter than the writer position on disk.
+func (fw *FileWriter) hashSyncLocked(to int64) error {
+	if fw.hash == nil || fw.hashPos == to {
+		return nil
+	}
+	if fw.hashPos < 0 || fw.hashPos > to {
+		fw.hash.Reset()
+		fw.hashPos = 0
+	}
+	from := fw.hashPos
+	if from == to {
+		return nil
+	}
+
+	f, err := os.Open(fw.path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			fw.hashPos = -1
+			return err
+		}
+		if from > 0 {
+			fw.hashPos = -1
+			return err
+		}
+	} else {
+		defer f.Close()
+		if _, err := f.Seek(from, io.SeekStart); err != nil {
+			fw.hashPos = -1
+			return err
+		}
+		n, err := io.CopyN(fw.hash, f, to-from)
+		fw.hashPos += n
+		if err != nil && !errors.Is(err, io.EOF) {
+			fw.hashPos = -1
+			return err
+		}
+	}
+
+	if fw.hashPos < to {
+		zeros := make([]byte, 32*1024)
+		for fw.hashPos < to {
+			n := int64(len(zeros))
+			if remaining := to - fw.hashPos; remaining < n {
+				n = remaining
+			}
+			if _, err := fw.hash.Write(zeros[:n]); err != nil {
+				fw.hashPos = -1
+				return err
+			}
+			fw.hashPos += n
+		}
+	}
+	return nil
+}
+
 // Write implements io.Writer, opening the file on the first call.
 // Short writes are looped until all of p is written or an error occurs.
 func (fw *FileWriter) Write(p []byte) (int, error) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
 	if err := fw.ensureOpen(); err != nil {
+		return 0, err
+	}
+	if err := fw.hashSyncLocked(fw.pos); err != nil {
 		return 0, err
 	}
 	written := 0
@@ -115,6 +234,16 @@ func (fw *FileWriter) Write(p []byte) (int, error) {
 		}
 		if n == 0 {
 			return written, io.ErrShortWrite
+		}
+	}
+	// Feed the hash once with exactly the bytes that landed on disk. On a
+	// hash failure the state is marked stale (hashPos -1) and rebuilt from
+	// disk before it is used again; the write itself still succeeds.
+	if written > 0 && fw.hash != nil {
+		if _, herr := fw.hash.Write(p[:written]); herr != nil {
+			fw.hashPos = -1
+		} else {
+			fw.hashPos += int64(written)
 		}
 	}
 	return written, nil
@@ -163,6 +292,9 @@ func (fw *FileWriter) Seek(offset int64, whence int) (int64, error) {
 		}
 	}
 	fw.pos = np
+	if fw.hash != nil && np < fw.hashPos {
+		fw.hashPos = -1
+	}
 	if !(whence == io.SeekCurrent && offset == 0) {
 		fw.seeked = true
 	}
@@ -183,8 +315,8 @@ func (fw *FileWriter) Sync() error {
 }
 
 // Close releases the file handle if one is open. The file itself is left on
-// disk. The writer cannot be used again after Close. When WithFileSync(true)
-// was set, the file is fsynced first.
+// disk. The writer cannot be used for further writes or seeks after Close.
+// When WithFileSync(true) was set, the file is fsynced first.
 func (fw *FileWriter) Close() error {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
@@ -238,6 +370,10 @@ func (fw *FileWriter) resetLocked() error {
 		}
 	}
 	fw.pos = 0
+	if fw.hash != nil {
+		fw.hash.Reset()
+		fw.hashPos = 0
+	}
 	fw.seeked = true
 	return nil
 }
@@ -287,6 +423,9 @@ func (fw *FileWriter) truncateLocked(pos int64) error {
 		}
 	}
 	fw.pos = pos
+	if fw.hash != nil && pos < fw.hashPos {
+		fw.hashPos = -1
+	}
 	fw.seeked = true
 	return nil
 }
@@ -311,6 +450,10 @@ func (fw *FileWriter) Cancel() error {
 		fw.f = nil
 	}
 	fw.pos = 0
+	if fw.hash != nil {
+		fw.hash.Reset()
+		fw.hashPos = 0
+	}
 	err := os.Remove(fw.path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
