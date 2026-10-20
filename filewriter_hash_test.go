@@ -3,7 +3,9 @@ package fetch
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -18,6 +20,20 @@ import (
 func digestSHA256(b []byte) []byte {
 	sum := sha256.Sum256(b)
 	return sum[:]
+}
+
+// flakyHash fails the first `failures` Write calls and then works normally.
+type flakyHash struct {
+	hash.Hash
+	failures int
+}
+
+func (f *flakyHash) Write(p []byte) (int, error) {
+	if f.failures > 0 {
+		f.failures--
+		return 0, errors.New("flaky hash: injected write failure")
+	}
+	return f.Hash.Write(p)
 }
 
 func TestFileWriterHashFresh(t *testing.T) {
@@ -140,6 +156,61 @@ func TestFileWriterHashSparseSeek(t *testing.T) {
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, want, data)
+}
+
+func TestFileWriterHashSumPastEOF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.bin")
+	fw := NewFileWriter(path, WithFileHash(sha256.New()))
+	defer fw.Close()
+
+	_, err := fw.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	_, err = fw.Seek(10, io.SeekStart)
+	require.NoError(t, err)
+	_, err = fw.Sum()
+	require.Error(t, err, "Sum must not digest phantom zeros past EOF")
+
+	_, err = fw.Write([]byte("x"))
+	require.NoError(t, err)
+
+	want := append(append([]byte("hello"), 0, 0, 0, 0, 0), 'x')
+	got, err := fw.Sum()
+	require.NoError(t, err, "a write materializes the sparse gap and makes Sum valid again")
+	assert.Equal(t, digestSHA256(want), got)
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, want, data)
+}
+
+func TestFileWriterHashSumMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.bin")
+	fw := NewFileWriter(path, WithFileHash(sha256.New()))
+	defer fw.Close()
+
+	_, err := fw.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(path))
+
+	_, err = fw.Sum()
+	require.Error(t, err, "Sum must not invent bytes for a missing file")
+}
+
+func TestFileWriterHashFeedFailureRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.bin")
+	h := &flakyHash{Hash: sha256.New(), failures: 1}
+	fw := NewFileWriter(path, WithFileHash(h))
+	defer fw.Close()
+
+	_, err := fw.Write([]byte("abc"))
+	require.NoError(t, err, "a failed hash feed must not fail the write")
+	_, err = fw.Write([]byte("def"))
+	require.NoError(t, err)
+
+	got, err := fw.Sum()
+	require.NoError(t, err)
+	assert.Equal(t, digestSHA256([]byte("abcdef")), got, "digest must rebuild from disk after a hash write failure")
 }
 
 func TestFileWriterHashThroughProgressWriter(t *testing.T) {

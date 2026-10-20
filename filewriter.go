@@ -37,10 +37,10 @@ func WithFileSync(enabled bool) FileOption {
 }
 
 // WithFileHash makes the writer feed every byte written to h so Sum can
-// return a digest of the complete file, including any partial data that was
-// already on disk when the writer was created. h is reset when the option is
-// applied and is owned by the writer; it must not be used concurrently.
-// Passing nil is ignored.
+// return a digest of the complete file, including any partial data that is
+// already on disk when the digest is first computed. h is reset when the
+// option is applied and is owned by the writer; it must not be used
+// concurrently. Passing nil is ignored.
 func WithFileHash(h hash.Hash) FileOption {
 	return func(fw *FileWriter) {
 		if h == nil {
@@ -125,7 +125,10 @@ func (fw *FileWriter) Pos() int64 {
 // Sum returns the digest of the complete file from offset 0 through the
 // writer's current position, including any partial data that was on disk when
 // the writer was created. It returns an error when no hash was configured
-// with WithFileHash or after Cancel. Sum may be called after Close.
+// with WithFileHash, after Cancel, and when the file is shorter than the
+// writer's position: bytes past the end of the file (an unwritten sparse gap
+// after Seek past EOF) have no file content to digest yet. Sum may be called
+// after Close.
 func (fw *FileWriter) Sum() ([]byte, error) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
@@ -134,6 +137,15 @@ func (fw *FileWriter) Sum() ([]byte, error) {
 	}
 	if fw.hash == nil {
 		return nil, fmt.Errorf("fetch: FileWriter.Sum: no hash configured")
+	}
+	if fw.pos > 0 {
+		st, err := os.Stat(fw.path)
+		if err != nil {
+			return nil, fmt.Errorf("fetch: FileWriter.Sum: %w", err)
+		}
+		if st.Size() < fw.pos {
+			return nil, fmt.Errorf("fetch: FileWriter.Sum: file is %d bytes, shorter than the writer position %d", st.Size(), fw.pos)
+		}
 	}
 	if err := fw.hashSyncLocked(fw.pos); err != nil {
 		return nil, err
@@ -144,7 +156,9 @@ func (fw *FileWriter) Sum() ([]byte, error) {
 // hashSyncLocked makes the hash represent exactly the file bytes in
 // [0, to). It must be called with fw.mu held. Rehashing from disk is needed
 // when a resumed file already has a prefix, after a rewind/truncate, or when a
-// sparse gap has to be represented as zero bytes.
+// sparse gap has to be represented as zero bytes. Zero padding stands in for
+// hole bytes that the next write materializes; Sum refuses to report a digest
+// while such a gap is still shorter than the writer position on disk.
 func (fw *FileWriter) hashSyncLocked(to int64) error {
 	if fw.hash == nil || fw.hashPos == to {
 		return nil
@@ -215,18 +229,21 @@ func (fw *FileWriter) Write(p []byte) (int, error) {
 		n, err := fw.f.Write(p[written:])
 		written += n
 		fw.pos += int64(n)
-		if fw.hash != nil && n > 0 {
-			if _, herr := fw.hash.Write(p[written-n : written]); herr != nil {
-				fw.hashPos = -1
-			} else {
-				fw.hashPos += int64(n)
-			}
-		}
 		if err != nil {
 			return written, err
 		}
 		if n == 0 {
 			return written, io.ErrShortWrite
+		}
+	}
+	// Feed the hash once with exactly the bytes that landed on disk. On a
+	// hash failure the state is marked stale (hashPos -1) and rebuilt from
+	// disk before it is used again; the write itself still succeeds.
+	if written > 0 && fw.hash != nil {
+		if _, herr := fw.hash.Write(p[:written]); herr != nil {
+			fw.hashPos = -1
+		} else {
+			fw.hashPos += int64(written)
 		}
 	}
 	return written, nil

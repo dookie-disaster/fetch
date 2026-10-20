@@ -108,7 +108,8 @@ if err == nil {
   `fw.Sum()` returns it. Existing bytes in a resumed file are included: they
   are read once from disk to seed the hash before the first new write. Fresh
   downloads add no extra read. The supplied hash is reset and owned by the
-  writer.
+  writer. `Sum` fails when the file is shorter than the writer's position (an
+  unwritten sparse gap after `Seek` past EOF has no bytes to digest yet).
 - To abort and discard the partial file, call `fw.Cancel()`.
 
 ## Retries
