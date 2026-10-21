@@ -288,7 +288,34 @@ Notable request options: `WithHeader(s)`, `WithCookieHeader`, `WithCookies`,
 - **Errors** — non-2xx → `*fetch.StatusError` (with `StatusCode`, `Status`,
   `Headers`, `Attempts`); non-replayable bodies → `fetch.ErrBodyNotReplayable`;
   exhausted redirect chains → `fetch.ErrTooManyRedirects`. All wrapping uses
-  `%w`, so `errors.Is`/`errors.As` work throughout.
+  `%w`, so `errors.Is`/`errors.As` work throughout. Once a fetch has returned,
+  `fetch.IsRetryable` classifies the final error for a higher-level retry and
+  `fetch.RetryAfter` extracts its `Retry-After` delay.
+
+### Higher-level retries
+
+A worker that wants to pause for longer than the built-in backoff can classify
+the final error before deciding to reschedule it:
+
+```go
+if err := s.Get(ctx, url, fw, fetch.WithResume(true)); err != nil {
+	if !fetch.IsRetryable(err) {
+		return err // 4xx, redirect loop, writer error, ...
+	}
+	wait, ok := fetch.RetryAfter(err)
+	if !ok {
+		wait = 5 * time.Minute
+	}
+	time.Sleep(wait)
+	// Retry with a fresh context. fw resumes from its current position.
+}
+```
+
+`IsRetryable` is stricter than the built-in policy for transport failures: it
+uses httpcloak's retryability verdict, so permanent TLS, proxy and protocol
+errors are not retried. It classifies the cause carried by the error only;
+callers reusing a writer must ensure it can resume (a `*FileWriter` with
+`WithResume` does), and a canceled or expired context must be replaced.
 
 ## Testing
 
