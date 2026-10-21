@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sardanioss/httpcloak/transport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,6 +36,262 @@ func TestDefaultRetryPolicy(t *testing.T) {
 	ri := &ResponseInfo{StatusCode: 200}
 	err := fmt.Errorf("fetch: read response body: %w (%w)", ErrIncompleteResponse, io.ErrUnexpectedEOF)
 	assert.True(t, policy(context.Background(), 0, ri, err), "incomplete response should retry")
+}
+
+func TestIsRetryable(t *testing.T) {
+	t.Run("nil", func(t *testing.T) {
+		assert.False(t, IsRetryable(nil))
+	})
+
+	t.Run("typed nil", func(t *testing.T) {
+		var se *StatusError
+		assert.False(t, IsRetryable(se), "typed-nil status error")
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: %w", se)), "wrapped typed-nil status error")
+
+		var te *transport.TransportError
+		assert.False(t, IsRetryable(te), "typed-nil transport error")
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: %w", te)), "wrapped typed-nil transport error")
+	})
+
+	t.Run("status", func(t *testing.T) {
+		for _, code := range []int{408, 425, 429, 500, 502, 503, 504} {
+			assert.True(t, IsRetryable(&StatusError{StatusCode: code}), "status %d", code)
+		}
+		for _, code := range []int{200, 301, 302, 400, 401, 403, 404, 409, 410, 416, 418} {
+			assert.False(t, IsRetryable(&StatusError{StatusCode: code}), "status %d", code)
+		}
+		assert.True(t, IsRetryable(fmt.Errorf("fetch GET: %w",
+			&StatusError{StatusCode: http.StatusServiceUnavailable})), "wrapped status error")
+	})
+
+	t.Run("incomplete response", func(t *testing.T) {
+		err := fmt.Errorf("fetch: read response body: %w (%w)", ErrIncompleteResponse, io.ErrUnexpectedEOF)
+		assert.True(t, IsRetryable(err))
+		assert.True(t, IsRetryable(fmt.Errorf("fetch GET: %w", err)))
+	})
+
+	t.Run("permanent sentinels", func(t *testing.T) {
+		assert.False(t, IsRetryable(ErrTooManyRedirects))
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: %w (3 hops)", ErrTooManyRedirects)))
+		assert.False(t, IsRetryable(ErrBodyNotReplayable))
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: %w", ErrBodyNotReplayable)))
+	})
+
+	t.Run("context", func(t *testing.T) {
+		assert.False(t, IsRetryable(context.Canceled))
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: %w", context.Canceled)))
+		assert.True(t, IsRetryable(context.DeadlineExceeded))
+		assert.True(t, IsRetryable(fmt.Errorf("fetch: %w", context.DeadlineExceeded)))
+	})
+
+	t.Run("transport", func(t *testing.T) {
+		retryable := transport.NewConnectionError("dial", "example.com", "443", "h2",
+			errors.New("connection refused"))
+		require.True(t, retryable.IsRetryable(), "test setup: connection refused is retryable")
+		assert.True(t, IsRetryable(retryable))
+		assert.True(t, IsRetryable(fmt.Errorf("fetch GET https://example.com: %w", retryable)))
+
+		permanent := &transport.TransportError{
+			Op:       "tls_handshake",
+			Category: transport.ErrTLS,
+			Cause:    errors.New("certificate expired"),
+		}
+		require.False(t, permanent.IsRetryable(), "test setup: TLS errors are permanent")
+		assert.False(t, IsRetryable(permanent))
+		assert.False(t, IsRetryable(fmt.Errorf("fetch GET https://example.com: %w", permanent)))
+	})
+
+	t.Run("net timeout fallback", func(t *testing.T) {
+		assert.True(t, IsRetryable(timeoutNetError{}))
+	})
+
+	t.Run("local and unknown errors", func(t *testing.T) {
+		assert.False(t, IsRetryable(errors.New("boom")))
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: prepare writer: %w", errors.New("disk full"))))
+	})
+}
+
+func TestIsRetryableAfterFetch(t *testing.T) {
+	t.Run("exhausted 503", func(t *testing.T) {
+		ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		s := testSession(t, WithDefaultRetries(1), WithDefaultBackoff(time.Millisecond, time.Millisecond))
+
+		err := s.Get(context.Background(), ts.URL, nil)
+		require.Error(t, err)
+		assert.True(t, IsRetryable(err))
+	})
+
+	t.Run("404", func(t *testing.T) {
+		ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		})
+		s := testSession(t, WithDefaultRetries(0))
+
+		err := s.Get(context.Background(), ts.URL, nil)
+		require.Error(t, err)
+		assert.False(t, IsRetryable(err))
+	})
+
+	t.Run("transport failure", func(t *testing.T) {
+		srv := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {})
+		url := srv.URL
+		srv.Close()
+
+		s := testSession(t, WithDefaultRetries(0))
+		err := s.Get(context.Background(), url, nil)
+		require.Error(t, err)
+		assert.True(t, IsRetryable(err))
+	})
+
+	t.Run("redirect loop", func(t *testing.T) {
+		ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/loop", http.StatusFound)
+		})
+		s := testSession(t, WithDefaultRetries(0))
+
+		err := s.Get(context.Background(), ts.URL+"/loop", nil)
+		require.Error(t, err)
+		assert.False(t, IsRetryable(err))
+	})
+
+	t.Run("non-replayable body", func(t *testing.T) {
+		ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+		})
+		s := testSession(t, WithDefaultRetries(1), WithDefaultBackoff(time.Millisecond, time.Millisecond))
+
+		err := s.Post(context.Background(), ts.URL, &oneShotReader{data: "payload"}, nil)
+		require.Error(t, err)
+		assert.False(t, IsRetryable(err))
+	})
+
+	t.Run("truncated body", func(t *testing.T) {
+		ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "11")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "short")
+		})
+		s := testSession(t, WithDefaultRetries(0))
+
+		err := s.Get(context.Background(), ts.URL, nil)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrIncompleteResponse)
+		assert.True(t, IsRetryable(err))
+	})
+
+	t.Run("non-rewindable partial write", func(t *testing.T) {
+		ts := truncatedServer(t, fullBody)
+		s := testSession(t, WithDefaultRetries(1))
+
+		w := &nonRewindableWriter{}
+		err := s.Get(context.Background(), ts.URL, w)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrIncompleteResponse)
+		assert.Contains(t, err.Error(), "non-rewindable")
+		assert.False(t, IsRetryable(err), "partial bytes cannot be replayed into the same writer")
+		assert.Equal(t, 1, ts.count(), "must fail fast without retrying")
+	})
+
+	t.Run("unrecoverable writer restore", func(t *testing.T) {
+		ts := truncatedServer(t, fullBody)
+		s := testSession(t, WithDefaultRetries(1))
+
+		w := &badRestoreWriter{}
+		err := s.Get(context.Background(), ts.URL, w)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrIncompleteResponse)
+		assert.Contains(t, err.Error(), "restore writer")
+		assert.False(t, IsRetryable(err), "a failed writer restore must not be retried")
+		assert.Equal(t, 1, ts.count(), "must fail without retrying")
+	})
+}
+
+func TestRetryAfter(t *testing.T) {
+	se := &StatusError{
+		StatusCode: http.StatusTooManyRequests,
+		Headers:    http.Header{"Retry-After": {"120"}},
+	}
+
+	d, ok := RetryAfter(se)
+	require.True(t, ok)
+	assert.Equal(t, 120*time.Second, d)
+
+	d, ok = RetryAfter(fmt.Errorf("fetch GET: %w", se))
+	require.True(t, ok)
+	assert.Equal(t, 120*time.Second, d, "wrapped status errors are understood")
+
+	date := time.Now().UTC().Add(2 * time.Second).Format(http.TimeFormat)
+	d, ok = RetryAfter(&StatusError{Headers: http.Header{"Retry-After": {date}}})
+	require.True(t, ok)
+	assert.Greater(t, d, 500*time.Millisecond)
+	assert.LessOrEqual(t, d, 3*time.Second)
+
+	d, ok = RetryAfter(&StatusError{Headers: http.Header{"Retry-After": {
+		time.Now().UTC().Add(-time.Hour).Format(http.TimeFormat)}}})
+	assert.True(t, ok)
+	assert.Zero(t, d, "a past date yields zero rather than a negative delay")
+
+	_, ok = RetryAfter(&StatusError{})
+	assert.False(t, ok)
+	_, ok = RetryAfter(&StatusError{Headers: http.Header{"Retry-After": {"soon"}}})
+	assert.False(t, ok)
+	_, ok = RetryAfter(errors.New("boom"))
+	assert.False(t, ok)
+	_, ok = RetryAfter(nil)
+	assert.False(t, ok)
+
+	var typedNil *StatusError
+	d, ok = RetryAfter(typedNil)
+	assert.False(t, ok)
+	assert.Zero(t, d)
+	_, ok = RetryAfter(fmt.Errorf("fetch: %w", typedNil))
+	assert.False(t, ok, "wrapped typed-nil status errors are not a status error")
+
+	var typedNilTransport *transport.TransportError
+	_, ok = RetryAfter(typedNilTransport)
+	assert.False(t, ok)
+	_, ok = RetryAfter(fmt.Errorf("fetch: %w", typedNilTransport))
+	assert.False(t, ok, "wrapped typed-nil transport errors are not a status error")
+}
+
+func TestRetryAfterAfterFetch(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	s := testSession(t, WithDefaultRetries(1))
+
+	err := s.Get(context.Background(), ts.URL, nil)
+	require.Error(t, err)
+	require.True(t, IsRetryable(err))
+
+	wait, ok := RetryAfter(err)
+	require.True(t, ok)
+	assert.Equal(t, 120*time.Second, wait)
+}
+
+type timeoutNetError struct{}
+
+func (timeoutNetError) Error() string   { return "i/o timeout" }
+func (timeoutNetError) Timeout() bool   { return true }
+func (timeoutNetError) Temporary() bool { return true }
+
+// badRestoreWriter supports position queries but fails when Fetch tries to
+// rewind it between attempts.
+type badRestoreWriter struct{ buf []byte }
+
+func (w *badRestoreWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+func (w *badRestoreWriter) Seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekCurrent {
+		return int64(len(w.buf)), nil
+	}
+	return 0, errors.New("seek failed")
 }
 
 func TestRetryOn500ThenSuccess(t *testing.T) {
