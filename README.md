@@ -300,13 +300,19 @@ the final error before deciding to reschedule it:
 ```go
 if err := s.Get(ctx, url, fw, fetch.WithResume(true)); err != nil {
 	if !fetch.IsRetryable(err) {
-		return err // 4xx, redirect loop, writer error, ...
+		return err // permanent 4xx, redirect loop, local writer error, ...
 	}
 	wait, ok := fetch.RetryAfter(err)
-	if !ok {
+	if !ok || wait > 5*time.Minute {
 		wait = 5 * time.Minute
 	}
-	time.Sleep(wait)
+	timer := time.NewTimer(wait)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
 	// Retry with a fresh context. fw resumes from its current position.
 }
 ```
@@ -315,7 +321,10 @@ if err := s.Get(ctx, url, fw, fetch.WithResume(true)); err != nil {
 uses httpcloak's retryability verdict, so permanent TLS, proxy and protocol
 errors are not retried. It classifies the cause carried by the error only;
 callers reusing a writer must ensure it can resume (a `*FileWriter` with
-`WithResume` does), and a canceled or expired context must be replaced.
+`WithResume` does), and a canceled or expired context must be replaced. A
+`Fetch` that aborted after writing to a non-rewindable writer reports that it
+could not retry even though the error wraps `fetch.ErrIncompleteResponse`; do
+not pass the same stream to another attempt.
 
 ## Testing
 

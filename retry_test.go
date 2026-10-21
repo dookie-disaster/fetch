@@ -43,6 +43,16 @@ func TestIsRetryable(t *testing.T) {
 		assert.False(t, IsRetryable(nil))
 	})
 
+	t.Run("typed nil", func(t *testing.T) {
+		var se *StatusError
+		assert.False(t, IsRetryable(se), "typed-nil status error")
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: %w", se)), "wrapped typed-nil status error")
+
+		var te *transport.TransportError
+		assert.False(t, IsRetryable(te), "typed-nil transport error")
+		assert.False(t, IsRetryable(fmt.Errorf("fetch: %w", te)), "wrapped typed-nil transport error")
+	})
+
 	t.Run("status", func(t *testing.T) {
 		for _, code := range []int{408, 425, 429, 500, 502, 503, 504} {
 			assert.True(t, IsRetryable(&StatusError{StatusCode: code}), "status %d", code)
@@ -205,6 +215,35 @@ func TestRetryAfter(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = RetryAfter(nil)
 	assert.False(t, ok)
+
+	var typedNil *StatusError
+	d, ok = RetryAfter(typedNil)
+	assert.False(t, ok)
+	assert.Zero(t, d)
+	_, ok = RetryAfter(fmt.Errorf("fetch: %w", typedNil))
+	assert.False(t, ok, "wrapped typed-nil status errors are not a status error")
+
+	var typedNilTransport *transport.TransportError
+	_, ok = RetryAfter(typedNilTransport)
+	assert.False(t, ok)
+	_, ok = RetryAfter(fmt.Errorf("fetch: %w", typedNilTransport))
+	assert.False(t, ok, "wrapped typed-nil transport errors are not a status error")
+}
+
+func TestRetryAfterAfterFetch(t *testing.T) {
+	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	s := testSession(t, WithDefaultRetries(1))
+
+	err := s.Get(context.Background(), ts.URL, nil)
+	require.Error(t, err)
+	require.True(t, IsRetryable(err))
+
+	wait, ok := RetryAfter(err)
+	require.True(t, ok)
+	assert.Equal(t, 120*time.Second, wait)
 }
 
 type timeoutNetError struct{}

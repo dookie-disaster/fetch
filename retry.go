@@ -69,7 +69,7 @@ func isRetryableStatus(code int) bool {
 // errors that abort a retry after partial bytes were written to a
 // non-rewindable writer may themselves wrap ErrIncompleteResponse.
 func IsRetryable(err error) bool {
-	if err == nil {
+	if err == nil || containsTypedNil(err) {
 		return false
 	}
 	if errors.Is(err, ErrTooManyRedirects) ||
@@ -80,6 +80,9 @@ func IsRetryable(err error) bool {
 
 	var se *StatusError
 	if errors.As(err, &se) {
+		if se == nil {
+			return false
+		}
 		return isRetryableStatus(se.StatusCode)
 	}
 	if errors.Is(err, ErrIncompleteResponse) {
@@ -91,14 +94,41 @@ func IsRetryable(err error) bool {
 
 	var te *transport.TransportError
 	if errors.As(err, &te) {
+		if te == nil {
+			return false
+		}
 		return te.IsRetryable()
 	}
 
 	// Some failures may surface as plain net errors without a transport
 	// wrapper. Timeouts are transient; anything else is treated as permanent.
 	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
+	if errors.As(err, &ne) && !isNilInterface(ne) && ne.Timeout() {
 		return true
+	}
+	return false
+}
+
+// containsTypedNil reports whether err's tree holds a typed-nil error value.
+// Such a value is a non-nil interface around a nil pointer; calling methods
+// like Unwrap or Is on it can dereference a nil receiver and panic, so callers
+// must reject these errors before traversing them with errors.Is or errors.As.
+func containsTypedNil(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isNilInterface(err) {
+		return true
+	}
+	switch x := err.(type) {
+	case interface{ Unwrap() error }:
+		return containsTypedNil(x.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, inner := range x.Unwrap() {
+			if containsTypedNil(inner) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -109,8 +139,11 @@ func IsRetryable(err error) bool {
 // with a zero or past time yields (0, true). The delay is not capped: callers
 // should apply their own maximum before sleeping.
 func RetryAfter(err error) (time.Duration, bool) {
+	if err == nil || containsTypedNil(err) {
+		return 0, false
+	}
 	var se *StatusError
-	if !errors.As(err, &se) {
+	if !errors.As(err, &se) || se == nil {
 		return 0, false
 	}
 	return retryAfterDelay(&ResponseInfo{Headers: se.Headers})
