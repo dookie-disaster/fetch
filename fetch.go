@@ -63,6 +63,12 @@ var ErrTooManyRedirects = errors.New("fetch: too many redirects")
 // can check for it with errors.Is to make their own call.
 var ErrIncompleteResponse = errors.New("fetch: incomplete response")
 
+// errWriterUnrecoverable marks a failure where partial bytes were written to a
+// writer that cannot be rewound. Retrying with the same writer could duplicate
+// or corrupt data, so IsRetryable reports it as non-retryable even when the
+// underlying transfer error was transient.
+var errWriterUnrecoverable = errors.New("fetch: writer cannot be restored for retry")
+
 // Session is a high-level HTTP fetch session. It wraps an httpcloak session
 // and adds retries, progress reporting, cookie injection, lazy file writing
 // and automatic resume on top of it.
@@ -266,7 +272,7 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 		// is static across attempts and a retry would re-send the same bytes.
 		if attemptWrote > 0 && !canRestoreWriter(writerForIO) {
 			return s.wrapFinal(method, target, attempt,
-				fmt.Errorf("fetch: cannot retry after %d bytes were written to non-rewindable writer: %w", attemptWrote, aerr))
+				fmt.Errorf("%w: cannot retry after %d bytes were written to non-rewindable writer: %w", errWriterUnrecoverable, attemptWrote, aerr))
 		}
 		if !rc.retryPolicy(ctx, attempt, ri, aerr) || attempt >= rc.maxRetries {
 			return s.wrapFinal(method, target, attempt, aerr)
@@ -290,7 +296,7 @@ func (s *Session) Fetch(ctx context.Context, method, rawURL string, body io.Read
 			if !willResume {
 				if rerr := restoreWriterToInitial(writerForIO, initPos, initSeekOK, initBufLen, initBufOK); rerr != nil {
 					return s.wrapFinal(method, target, attempt,
-						fmt.Errorf("fetch: restore writer for retry: %w (%w)", rerr, aerr))
+						fmt.Errorf("%w: restore writer for retry: %w (%w)", errWriterUnrecoverable, rerr, aerr))
 				}
 				if pw != nil {
 					pw.SetWritten(0)

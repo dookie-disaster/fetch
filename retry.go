@@ -55,7 +55,10 @@ func isRetryableStatus(code int) bool {
 // complete on another attempt, and context.DeadlineExceeded is retryable when
 // the caller supplies a fresh context. ErrTooManyRedirects,
 // ErrBodyNotReplayable, context.Canceled and local failures (invalid URL or
-// configuration, writer/disk errors, unknown errors) are not retryable.
+// configuration, writer/disk errors, unknown errors) are not retryable. When
+// Fetch aborts after partial bytes were written to a writer it cannot rewind,
+// IsRetryable reports false even though the error also wraps
+// ErrIncompleteResponse; retrying that failure requires a fresh writer.
 //
 // IsRetryable is deliberately stricter than DefaultRetryPolicy for
 // transport-level failures: it consults the underlying httpcloak transport's
@@ -65,15 +68,14 @@ func isRetryableStatus(code int) bool {
 // err passed to them when ri is nil.
 //
 // The classification covers the cause carried by err only. Callers retrying
-// with the same writer must still ensure that writer can resume or rewind:
-// errors that abort a retry after partial bytes were written to a
-// non-rewindable writer may themselves wrap ErrIncompleteResponse.
+// with the same writer must still ensure that writer can resume or rewind.
 func IsRetryable(err error) bool {
 	if err == nil || containsTypedNil(err) {
 		return false
 	}
 	if errors.Is(err, ErrTooManyRedirects) ||
 		errors.Is(err, ErrBodyNotReplayable) ||
+		errors.Is(err, errWriterUnrecoverable) ||
 		errors.Is(err, context.Canceled) {
 		return false
 	}

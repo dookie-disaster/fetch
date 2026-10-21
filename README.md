@@ -319,12 +319,13 @@ if err := s.Get(ctx, url, fw, fetch.WithResume(true)); err != nil {
 
 `IsRetryable` is stricter than the built-in policy for transport failures: it
 uses httpcloak's retryability verdict, so permanent TLS, proxy and protocol
-errors are not retried. It classifies the cause carried by the error only;
-callers reusing a writer must ensure it can resume (a `*FileWriter` with
-`WithResume` does), and a canceled or expired context must be replaced. A
-`Fetch` that aborted after writing to a non-rewindable writer reports that it
-could not retry even though the error wraps `fetch.ErrIncompleteResponse`; do
-not pass the same stream to another attempt.
+errors are not retried. When Fetch aborts after partial bytes were written to a
+writer it cannot rewind, `IsRetryable` returns false even though the error wraps
+`fetch.ErrIncompleteResponse`, because retrying into the same stream could
+duplicate data; use a fresh writer to retry that failure. Otherwise it
+classifies the cause carried by the error only: callers reusing a writer must
+ensure it can resume (a `*FileWriter` with `WithResume` does), and a canceled
+or expired context must be replaced.
 
 ## Testing
 

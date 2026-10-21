@@ -180,6 +180,32 @@ func TestIsRetryableAfterFetch(t *testing.T) {
 		assert.ErrorIs(t, err, ErrIncompleteResponse)
 		assert.True(t, IsRetryable(err))
 	})
+
+	t.Run("non-rewindable partial write", func(t *testing.T) {
+		ts := truncatedServer(t, fullBody)
+		s := testSession(t, WithDefaultRetries(1))
+
+		w := &nonRewindableWriter{}
+		err := s.Get(context.Background(), ts.URL, w)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrIncompleteResponse)
+		assert.Contains(t, err.Error(), "non-rewindable")
+		assert.False(t, IsRetryable(err), "partial bytes cannot be replayed into the same writer")
+		assert.Equal(t, 1, ts.count(), "must fail fast without retrying")
+	})
+
+	t.Run("unrecoverable writer restore", func(t *testing.T) {
+		ts := truncatedServer(t, fullBody)
+		s := testSession(t, WithDefaultRetries(1))
+
+		w := &badRestoreWriter{}
+		err := s.Get(context.Background(), ts.URL, w)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrIncompleteResponse)
+		assert.Contains(t, err.Error(), "restore writer")
+		assert.False(t, IsRetryable(err), "a failed writer restore must not be retried")
+		assert.Equal(t, 1, ts.count(), "must fail without retrying")
+	})
 }
 
 func TestRetryAfter(t *testing.T) {
@@ -251,6 +277,22 @@ type timeoutNetError struct{}
 func (timeoutNetError) Error() string   { return "i/o timeout" }
 func (timeoutNetError) Timeout() bool   { return true }
 func (timeoutNetError) Temporary() bool { return true }
+
+// badRestoreWriter supports position queries but fails when Fetch tries to
+// rewind it between attempts.
+type badRestoreWriter struct{ buf []byte }
+
+func (w *badRestoreWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+func (w *badRestoreWriter) Seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekCurrent {
+		return int64(len(w.buf)), nil
+	}
+	return 0, errors.New("seek failed")
+}
 
 func TestRetryOn500ThenSuccess(t *testing.T) {
 	ts := newTestServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
