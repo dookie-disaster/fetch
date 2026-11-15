@@ -3,7 +3,7 @@ module github.com/dookie-disaster/fetch
 go 1.26.0
 
 require (
-	github.com/sardanioss/httpcloak v1.7.3
+	github.com/sardanioss/httpcloak v1.7.4
 	github.com/stretchr/testify v1.12.1
 )
 
